@@ -10,7 +10,7 @@ import geopandas as gpd
 import os
 import h5py
 import rasterio as rio
-from shapely.geometry import Point
+from shapely.geometry import Point, GeometryCollection
 from astropy.time import Time
 import glob
 import numpy as np
@@ -27,9 +27,12 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 
+from dateutil import parser
+from fiona.crs import from_epsg
+
 
 def rasterio_to_gtiff_xarray(arr, meta, path='.', *args, **kwargs):
-    tmp_path = os.path.join(path, '%s.tif' % str(uuid.uuid4()))
+    tmp_path = os.path.join(path, '%s.tmp.tif' % str(uuid.uuid4()))
     with rio.open(tmp_path, 'w', **meta) as fil2:
         fil2.write(arr)
     out = xr.open_rasterio(tmp_path, *args, **kwargs)
@@ -45,7 +48,27 @@ def rasterio_to_gtiff_xarray(arr, meta, path='.', *args, **kwargs):
 #     return out
 
 
-class ICESATReader(object):
+class _Reader(object):
+    def __init__(self, path, bbox=None, time=None, *args, **kwargs):
+        self.path = path
+        self.bbox = bbox
+        self.time = time
+
+    def _which_bbox(self, bbox):
+        if bbox is None:
+            bbox = self.bbox
+        return bbox
+
+    def _which_time(self, time):
+        if time is None:
+            bbox = self.time
+        return time
+
+    def query(self, time=None, bbox=None, n_jobs=2, epsg=None, *args, **kwargs):
+        pass
+
+
+class ICESATReader(_Reader):
     atl06 = {'lat': '/land_ice_segments/latitude',
              'lon': '/land_ice_segments/longitude',
              'h': '/land_ice_segments/h_li',
@@ -66,21 +89,27 @@ class ICESATReader(object):
 
     keywords = {(2, 6): atl06, (2, 8): atl08}
 
-    def __init__(self, dirpath, mission=2, prod_nr=6):
-        self.dirpath = dirpath
+    def __init__(self, dirpath, mission=2, prod_nr=8, bbox=None, time=None):
+        _Reader.__init__(self, path=dirpath, bbox=bbox, time=time)
         self.mission = mission
         self.prod_nr = prod_nr
         self.dict = self.keywords[(self.mission, self.prod_nr)]
 
-    def query(self, n_jobs=2, time=None, segments=None, *args, **kwargs):
+    def query(self, n_jobs=2, time=None, segments=None, bbox=None, *args, **kwargs):
         """
         Reads the icesat data files according to the query specifications.
         """
-        fnames = glob.glob(os.path.join(self.dirpath, '*.h5'))
-        fnames = np.array_split(self.select_files(fnames, time=time, segments=segments), n_jobs)
-        return pd.concat(Parallel(n_jobs=n_jobs, verbose=5)(delayed(self._query)(f, *args, **kwargs) for f in fnames))
+        bbox = self._which_bbox(bbox)
+        time = self._which_time(time)
 
-    def _query(self, fnames, bbox=None, quality=0, out=False, values=[], *args, **kwargs):
+        fnames = glob.glob(os.path.join(self.path, '*.h5'))
+        fnames = np.array_split(self.select_files(fnames, time=time, segments=segments), n_jobs)
+        dfs, bboxs = zip(*Parallel(n_jobs=n_jobs,
+                                   verbose=5)(delayed(self._read)(f, bbox=bbox, *args, **kwargs) for f in fnames))
+
+        return pd.concat(dfs), bboxs
+
+    def _read(self, fnames, bbox=None, quality=0, out=False, values=[], epsg=None, *args, **kwargs):
         """ Params
         ------
             fnames (iter) : iterable of paths
@@ -154,11 +183,14 @@ class ICESATReader(object):
                 # 3) Convert time and separate tracks #
                 # -------------------------------------#
 
-                # Time in GPS seconds (secs sinde 1980...)
+                # Time in GPS seconds (secs since 1980...)
                 t_gps = t_ref + t_dt
 
                 # Time in decimal years
                 t_year = self.gps2dyr(t_gps)
+                time = np.vectorize(self._decimal_to_datetime)(decimal=t_year)
+
+                t_iso = np.vectorize(lambda d: dt.datetime.strftime(d, format='%Y-%m-%d'))(time)
 
                 # Determine orbit type
                 i_asc, i_des = self.track_type(t_year, lat)
@@ -168,11 +200,12 @@ class ICESATReader(object):
                 # -----------------------#
 
                 # Save variables
-                custom_vars['lon'] = lon
-                custom_vars['lat'] = lat
+                custom_vars['x'] = lon
+                custom_vars['y'] = lat
                 custom_vars['h_elv'] = h
-                custom_vars['t_year'] = t_year
+                custom_vars['time'] = time
                 custom_vars['t_sec'] = t_gps
+                custom_vars['t_iso'] = t_iso
                 custom_vars['s_elv'] = s_li
                 custom_vars['q_flg'] = q_flag
                 custom_vars['ascending'] = i_asc
@@ -193,9 +226,20 @@ class ICESATReader(object):
 
         # create GeoPandas DataFrame for proper registering
         if not df.empty:
-            points = [Point(x, y) for x, y in zip(df.lon, df.lat)]
-            df = gpd.GeoDataFrame(df, geometry=points, crs='epsg:4326')
-        return df
+            points = [Point(x, y) for x, y in zip(df.x, df.y)]
+            df = gpd.GeoDataFrame(df, geometry=points, crs=from_epsg(4326))
+
+            if epsg is not None:
+                df = df.to_crs(epsg=epsg)
+
+        return df, bbox
+
+    def _decimal_to_datetime(self, decimal):
+        year = np.int(decimal)
+        rem = decimal - year
+
+        base = dt.datetime(year, 1, 1)
+        return base + dt.timedelta(seconds=(base.replace(year=base.year + 1) - base).total_seconds() * rem)
 
     def segment_from_fname(self, fname):
         """ IS2 fname -> segment number. """
@@ -233,7 +277,7 @@ class ICESATReader(object):
         """ Convert GPS time to decimal years. """
         return Time(time, format='gps').decimalyear
 
-    def track_type(self, time, lat, tmax=1):
+    def track_type(self, time, lat):
         """
         Separate tracks into ascending and descending.
 
@@ -269,45 +313,19 @@ class ICESATReader(object):
         return time
 
 
-class _RasterReader(object):
+class _RasterReader(_Reader):
     """
     _RasterReader is an interface between SWISSMap and rasterio reading. It handles queries related to raster operations
     during reading. Readers specific to some data type or directory structure build on top of _RasterReader.
     """
 
-    def __init__(self, path, bbox=None):
-        self.path = path
-        self.bbox = bbox
+    def __init__(self, path, bbox=None, time=None, *args, **kwargs):
+        _Reader.__init__(self, path, bbox=bbox, time=time)
 
-        if self.bbox is not None:
-            assert type(self.bbox) is bs.BBox
-
-    def read(self, path=None, bbox=None, align=True, *args, **kwargs):
-        if path is None:
-            path = self.path
-
-        # single read
-        if type(path) is str:
-            return self._read(path, bbox=bbox, *args, **kwargs)
-
-        # multiple read
-        elif hasattr(path, '__iter__') and not align:
-            return [self._read(p, bbox=bbox, *args, **kwargs) for p in path]
-
-        # read and align
-        elif hasattr(path, '__iter__') and align:
-            return self._read_and_align(path, bbox=bbox, *args, **kwargs)
-
-        # raise exception
-        else:
-            raise ValueError('path must be str or an iterable of str \
-                              or must be supplied during initialization')
-
-    def _read(self, path, bbox=None, *args, **kwargs):
+    def read(self, paths=None, bbox=None, align=True, epsg=4326, *args, **kwargs):
         """
-        Wrapper for rasterio's read. allows to specify a bounding box. args and kwargs according to rasterio's read
-        or, when bbox is specified, according to rasterio.mask.mask
-        :param path:
+        Read rasters in paths constrained by bbox. No resampling and alignment is performed.
+        :param paths:
         :param bbox:
         :param args:
         :param kwargs:
@@ -315,50 +333,89 @@ class _RasterReader(object):
         """
         bbox = self._which_bbox(bbox)
 
-        if bbox is not None:
-            with rio.open(path) as fil:
-                coords = bbox.get_rasterio_coords(fil.crs.data)
-                out_img, out_transform = mask(dataset=fil, shapes=coords,
-                                              crop=True, *args, **kwargs)
-                out_meta = fil.meta.copy()
+        # single file read
+        if paths is None:
+            paths = self.path
+        if type(paths) is str:
+            paths = [paths]
 
-                out_meta.update({"driver": "GTiff",
-                                 "height": out_img.shape[1],
-                                 "width": out_img.shape[2],
-                                 "transform": out_transform,
-                                 "count": fil.count,
-                                 "dtype": out_img.dtype})
+        out_xarrs = []
+        out_bboxs = []
 
-            out = rasterio_to_gtiff_xarray(out_img, out_meta, *args, **kwargs)
+        if align:
+            assert bbox is not None
+            for path in paths:
+                # crop tif and save to tmp file
+                _, tmp_path = self._crop_tif(path, bbox=bbox, to_file=True)
+
+                # warp image
+                out = self._warp_tif(tmp_path, bbox=bbox, epsg=epsg)
+
+                os.remove(tmp_path)
+
+                out.attrs['path'] = path
+                out_xarrs.append(out)
+                out_bboxs.append(bbox)
+
         else:
-            with rio.open(path) as fil:
-                out = xr.open_rasterio(fil, *args, **kwargs)
+            for path in paths:
+                if bbox is not None:
+                    out, _ = self._crop_tif(path, bbox=bbox, to_file=False)
+                else:
+                    with rio.open(path, 'r') as fil:
+                        out = xr.open_rasterio(fil, *args, **kwargs)
 
-        out.attrs['path'] = path
-        return out
+                    # make bbox that is returned
+                    bbox = self._get_bbox_from_tif(path)
 
-    def _read_and_align(self, paths, bbox=None, epsg=3857, *args, **kwargs):
-        bbox = self._which_bbox(bbox)
+                out.attrs['path'] = path
+                out_xarrs.append(out)
+                out_bboxs.append(bbox)
 
-        paths, path_names = zip(*paths)
+        return out_xarrs, out_bboxs
 
-        if bbox is not None:
-            left, bottom, right, top = bbox.get_bounds(epsg=epsg)
-            res = bbox.get_resolution(epsg)
+    def _get_bbox_from_tif(self, path):
+        with rio.open(path) as fil:
+            bbox = fil.bounds
+            fil_epsg = rio.crs.CRS.to_epsg(fil.crs)
+
+            bbox = bs.BBox.from_rasterio_bbox(bbox, fil_epsg)
+
+            res = fil.res
+            bbox.set_resolution(res, fil_epsg)
+        return bbox
+
+    def _crop_tif(self, path, bbox, to_file=False):
+        with rio.open(path) as fil:
+            coords = bbox.get_rasterio_coords(fil.crs.data)
+            out_img, out_transform = mask(dataset=fil, shapes=coords, crop=True)
+            out_meta = fil.meta.copy()
+
+            out_meta.update({"driver": "GTiff",
+                             "height": out_img.shape[1],
+                             "width": out_img.shape[2],
+                             "transform": out_transform,
+                             "count": fil.count,
+                             "dtype": out_img.dtype})
+
+        tmp_path = os.path.join('.', '%s.tmp.tif' % str(uuid.uuid4()))
+        with rio.open(tmp_path, 'w', **out_meta) as fil:
+            fil.write(out_img)
+
+        if to_file:
+            return None, tmp_path
         else:
-            with rio.open(paths[0]) as fil:
-                bbox = fil.bounds
-                fil_epsg = rio.crs.CRS.to_epsg(fil.crs)
+            out = rasterio_to_gtiff_xarray(out_img, out_meta)
+            os.remove(tmp_path)
+            return out, None
 
-                bbox = bs.BBox.from_rasterio_bbox(bbox, fil_epsg)
-                left, bottom, right, top = bbox.get_bounds(epsg)
-
-                res = fil.res
-                bbox.set_resolution(res, fil_epsg)
+    def _warp_tif(self, path, bbox, epsg, *args, **kwargs):
+        left, bottom, right, top = bbox.get_bounds(epsg=epsg)
+        res = bbox.get_resolution(epsg)
 
         height = (right - left) // res[0]
         width = (top - bottom) // res[1]
-        dst_transform = affine.Affine(res[0], 0.0, left, 0.0, -res[1], top)
+        dst_transform = rio.transform.from_origin(west=left, north=top, xsize=res[0], ysize=res[0])
 
         vrt_options = {
             'resampling': Resampling.cubic,
@@ -368,40 +425,25 @@ class _RasterReader(object):
             'width': width,
         }
 
-        out = None
-        for path, path_name in zip(paths, path_names):
-            with rio.open(path) as src:
-                with WarpedVRT(src, **vrt_options) as vrt:
+        with rio.open(path) as src:
+            with WarpedVRT(src, **vrt_options) as vrt:
 
-                    # At this point 'vrt' is a full dataset with dimensions,
-                    # CRS, and spatial extent matching 'vrt_options'.
+                # At this point 'vrt' is a full dataset with dimensions,
+                # CRS, and spatial extent matching 'vrt_options'.
+                dta = vrt.read()
+                # # Read all data into memory.
+                # #
+                vrt_meta = vrt.meta.copy()
 
-                    # Read all data into memory.
-                    dta = vrt.read()
+                vrt_meta.update({"driver": "GTiff",
+                                 "height": dta.shape[1],
+                                 "width": dta.shape[2],
+                                 "transform": dst_transform,
+                                 "count": vrt.count})
 
-                    # Process the dataset in chunks.  Likely not very efficient.
-                    # for _, window in vrt.block_windows():
-                    #     dta = vrt.read(window=window)
+                xarr = rasterio_to_gtiff_xarray(dta, vrt_meta, *args, **kwargs)
 
-                    vrt_meta = vrt.meta.copy()
-
-                    vrt_meta.update({"driver": "GTiff",
-                                     "height": dta.shape[1],
-                                     "width": dta.shape[2],
-                                     "transform": vrt_options['transform'],
-                                     "count": vrt.count})
-
-                    if out is None:
-                        out = rasterio_to_gtiff_xarray(dta, vrt_meta, *args, **kwargs).to_dataset(name=path_name)
-                    else:
-                        out[path_name] = rasterio_to_gtiff_xarray(dta, vrt_meta, *args, **kwargs)
-
-        return out, bbox
-
-    def _which_bbox(self, bbox):
-        if bbox is None:
-            bbox = self.bbox
-        return bbox
+        return xarr
 
 
 class _TimeRasterReader(_RasterReader):
@@ -410,19 +452,19 @@ class _TimeRasterReader(_RasterReader):
     _create_path_dict.
     """
 
-    def __init__(self, dirpath, bbox=None, time=None):
-        _RasterReader.__init__(self, dirpath, bbox)
-        self.time = time
+    def __init__(self, dirpath, bbox=None, time=None, *args, **kwargs):
+        _RasterReader.__init__(self, path=dirpath, bbox=bbox, time=time, *args, **kwargs)
 
         self._path_dict = self._create_path_dict()
         self.min_time = min(self._path_dict.values())
         self.max_time = max(self._path_dict.values())
 
-    def query(self, bbox=None, time=None, *args, **kwargs):
+    def query(self, bbox=None, time=None, align=False, *args, **kwargs):
         bbox = self._which_bbox(bbox)
+        time = self._which_time(time)
 
         if time is None:
-            pathes_times = list(self._path_dict)
+            pathes_times = list(self._path_dict.items())
         else:
             start, end = time
             if start is None:
@@ -431,16 +473,16 @@ class _TimeRasterReader(_RasterReader):
                 end = self.max_time
             pathes_times = list((path, time) for path, time in self._path_dict.items() if start <= time <= end)
 
-        ret = None
-        for path, time in pathes_times:
-            arr = self.read(path, bbox=bbox, *args, **kwargs).expand_dims('time')
-            arr.coords['time'] = ('time', [time])
+        if len(pathes_times) == 0:
+            return None, [bbox]
 
-            if ret is None:
-                ret = arr
-            else:
-                ret = xr.concat((ret, arr), 'time')
-        return ret
+        paths, times = zip(*pathes_times)
+        arrs, bboxs = self.read(paths, bbox=bbox, align=True, *args, **kwargs)
+
+        ret = xr.concat(arrs, 'time')
+        ret.coords['time'] = ('time', np.array(times))
+
+        return ret, bboxs
 
     def _create_path_dict(self):
         pass
@@ -466,20 +508,77 @@ def read_raster(path, bbox=None, *args, **kwargs):
     return _RasterReader(path, bbox).read(*args, **kwargs)
 
 
-def read_slf(path):
-    # read tmp data
-    glob_re = lambda pattern, strings: filter(re.compile(pattern).match, strings)
-    fnames = glob_re(r'one_year_imis_\d*\.csv', os.listdir(path))
+class SLFReader(_Reader):
+    def __init__(self, *args, **kwargs):
+        _Reader.__init__(self, *args, **kwargs)
+        self._cached_slf_data, self.slf_stations = self.load_slf_data()
 
-    slf = pd.DataFrame()
-    for fname in fnames:
-        slf = pd.concat((slf, pd.read_csv(os.path.join(path, fname))))
+    def load_slf_data(self):
+        # read station data
+        slfstats_file = 'SLF_utm32_cood.csv'
+        slfstats = pd.read_csv(os.path.join(self.path, slfstats_file))
 
-    # read station data
-    slfstats_file = 'SLF_utm32_cood.csv'
-    slfstats = pd.read_csv(os.path.join(path, slfstats_file))
+        # tidy up station data
+        slfstats['slf station code'] = slfstats['slf station code'].map(str) + slfstats['slf_locati,N,10,0'].map(str)
+        slfstats.drop(columns=['slf_locati,N,10,0'])
 
-    return slf, slfstats
+        slf_codes = dict((row['slf station code'],
+                          {'geometry':Point(row['X_utm,C,254'],
+                                            row['Y_utm,C,254']),
+                           'height': row['altitude_a,N,10,0']}) for idx, row in slfstats.iterrows())
+
+        # read time series data
+        glob_re = lambda pattern, strings: filter(re.compile(pattern).match, strings)
+        fnames = glob_re(r'one_year_imis_\d*\.csv', os.listdir(self.path))
+
+        slf = pd.DataFrame()
+        for fname in fnames:
+            slf = pd.concat((slf, pd.read_csv(os.path.join(self.path, fname))))
+
+        # tidy up slf
+        slf['stat_abk'] = slf['stat_abk'].map(str) + slf['stao_nr'].map(str)
+        slf.drop(columns=['stao_nr'])
+
+        slf['datetime'] = pd.to_datetime(slf['datetime [utc+1]'].map(str), format='%Y%m%d%H%M%S', errors='coerce')
+        slf.drop(columns='datetime [utc+1]')
+
+        # convert time series data to gpd.GeoDataFrame by adding location info
+        slf['height'] = [slf_codes[code]['height'] if code in slf_codes else np.nan for code in slf['stat_abk']]
+        geometry = [slf_codes[code]['geometry'] if code in slf_codes else GeometryCollection() for code in slf['stat_abk']]
+
+        return gpd.GeoDataFrame(slf, crs=from_epsg(4326), geometry=geometry), slf_codes
+
+    def query(self, time=None, bbox=None, epsg=None, *args, **kwargs):
+        time = self._which_time(time)
+        bbox = self._which_bbox(bbox)
+
+        # take out measurements that are not time frame
+        slf = self._filter_time(self._cached_slf_data, time)
+
+        # take out measurements that are not in bbox
+        slf = self._filter_bbox(slf, bbox)
+
+        if epsg is not None:
+            slf = slf.to_crs(epsg=epsg)
+
+        return slf, bbox
+
+    def _filter_time(self, df, time):
+        if time is not None:
+            start, end = time
+            if start is not None:
+                time_idx = df[df['datetime'] < start].index
+                df.drop(time_idx, inplace=True)
+            if end is not None:
+                time_idx = df[df['datetime'] > end].index
+                df.drop(time_idx, inplace=True)
+        return df
+
+    def _filter_bbox(self, df, bbox):
+        if bbox is not None:
+            df = df.to_crs(bbox.df.crs)
+            df = gpd.sjoin(df, bbox.df, how='left')
+        return df
 
 
 if __name__ == '__main__':

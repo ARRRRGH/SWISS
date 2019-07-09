@@ -1,7 +1,9 @@
 import geopandas as gpd
 from fiona.crs import from_epsg
-from shapely.geometry import box, Point
+from shapely.geometry import box, Point, mapping
+
 import json
+
 
 class BBox(object):
     def __init__(self, bbox, epsg=4326, res=None):
@@ -33,7 +35,6 @@ class BBox(object):
         left, bottom, right, top = self.get_bounds()
 
         mid_point_coords = (left + right) // 2, (top + bottom) // 2
-        print(mid_point_coords, self._res)
         ref_point_coords = mid_point_coords[0] + self._res[0], mid_point_coords[1] + self._res[1]
         pts = [Point(coords) for coords in (mid_point_coords, ref_point_coords)]
 
@@ -49,7 +50,7 @@ class BBox(object):
         return self.df
 
     def get_bounds(self, epsg=None):
-        return self._get(epsg)['geometry'][0].bounds
+        return self._get(epsg=epsg)['geometry'][0].bounds
 
     def get_rasterio_coords(self, crs=None):
         # https://automating-gis-processes.github.io/CSC18/lessons/L6/clipping-raster.html
@@ -57,7 +58,15 @@ class BBox(object):
             df = self.df.to_crs(crs=crs)
         else:
             df = self.df
-        return [json.loads(df.to_json())['features'][0]['geometry']]
+        return [mapping(df['geometry'][0])]
+
+    def to_xlim(self, epsg=None):
+        bounds = self.get_bounds(epsg)
+        return bounds[0], bounds[2]
+
+    def to_ylim(self, epsg=None):
+        bounds = self.get_bounds(epsg)
+        return bounds[1], bounds[3]
 
     @staticmethod
     def from_rasterio_bbox(bbox, epsg):
