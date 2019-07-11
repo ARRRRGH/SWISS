@@ -39,11 +39,6 @@ class SWISSMap(rs._Reader):
         # Read time invariant variables
         qmap, bboxs = self._get_time_invariant_map(bbox=bbox, epsg=epsg, *args, **kwargs)
 
-        # clean qmap
-        qmap = qmap.squeeze('band')
-        for var in qmap.variables:
-            qmap[var] = qmap[var].where(qmap[var] != qmap[var].attrs['nodatavals'][0])
-
         # make sure that, in case no bbox is supplied, data are aligned with qmap
         bbox = bboxs[0]
 
@@ -55,44 +50,71 @@ class SWISSMap(rs._Reader):
 
         return qmap, snow_data, ice_data, slf_data
 
-    def raster_to_point(self, dframe, xset, method='nearest', *args, **kwargs):
+    @staticmethod
+    def raster_to_point(dframe, xset, method='nearest', radius_of_influence=1000, inplace=True, *args, **kwargs):
         resample_funcs = {'nearest': pyr.kd_tree.resample_nearest}
         resample_func = resample_funcs[method]
 
-        pts = pyr.geometry.SwathDefinition(dframe.y, dframe.x)
-        _time_binned_pts = {}
+        grid = None
+        swath = None
+        _time_binned_swaths = {}
+        _time_binned_dframes = {}
 
-        for var in xset.variables:
+        # make sure we are in lat / lon coordinates which is what pyresample assumes
+        assert dframe.crs['init'] == 'epsg:4326'
+
+        # make sure we are in lat / lon coordinates which pyresample assumes
+        # since all vars in xset are aligned, check only first one
+        assert list(xset.items())[0][1].attrs['crs'] == '+init=epsg:4326'
+
+        for var in xset.data_vars:
+            # all vars in xset are aligned
+            if grid is None:
+                lats = xset[var]['y']
+                lons = xset[var]['x']
+                lons, lats = np.meshgrid(lons, lats)
+                grid = pyr.geometry.GridDefinition(lats=lats, lons=lons)
+
             if 'time' in xset[var].coords:
-                if _time_binned_pts == {}:
-                    ts = xset[var].coords['time']
-                    bins = pd.IntervalIndex.from_tuples([(x, y) for x, y in zip(ts[::2], ts[1::2])])
+                # all vars in xset have same time resolution, so create index and swaths only once
+                if _time_binned_swaths == {}:
+                    ts = xset[var].coords['time'].data.astype(dt.datetime)
+
+                    bins = pd.IntervalIndex.from_tuples([((t0 + t1) / 2, (t1 + t2) / 2)
+                                                         for t0, t1, t2 in zip(ts, ts[1:], ts[2:])])
                     idxs = pd.cut(dframe['time'], bins=bins, labels=False)
 
                     for i in np.unique(idxs):
-                        _time_binned_pts[i] = dframe.iloc[idxs]
+                        dfi = dframe.iloc[np.where(idxs == i)[0]]
+                        _time_binned_swaths[i] = pyr.geometry.SwathDefinition(dfi.y, dfi.x)
+                        _time_binned_dframes[i] = dfi
 
-                times = zip(xset.isel(time=i)[var], _time_binned_pts)
+                times = [zip(xset[var].isel(time=i),
+                             _time_binned_dframes[i],
+                             _time_binned_swaths[i])
+                         for i in _time_binned_swaths.keys()]
 
             else:
-                times = (xset[var], dframe)
+                # same data points for all vars
+                if swath is None:
+                    swath = pyr.geometry.SwathDefinition(lats=dframe.y, lons=dframe.x)
 
-            # make sure we are in correct projection
-            assert xset[var].attrs['crs'] == '+init=epsg:4326'
+                times = [(xset[var], dframe, swath)]
+
+            if not inplace:
+                dframe = dframe.copy()
 
             dframe[var] = np.nan
-            for grid, pts in times:
-                griddef = pyr.geometry.GridDefinition(lats=grid['y'], lons=grid['x'])
-                data = resample_func(source_geo_def=griddef,
-                                     target_geo_def=pts,
-                                     data=griddef,
-                                     radius_of_influence=50000)
-                dframe.index[pts.index][var] = data
+            for var_at_t, dframe_at_t, swath_at_t in times:
+                data = resample_func(source_geo_def=grid,
+                                     target_geo_def=swath_at_t,
+                                     data=var_at_t.data,
+                                     radius_of_influence=radius_of_influence,
+                                     *args, **kwargs)
+
+                dframe.loc[dframe_at_t.index, var] = pd.Series(data)
 
         return dframe
-
-
-
 
     def _get_time_invariant_map(self, epsg, bbox=None, *args, **kwargs):
         """
@@ -105,8 +127,8 @@ class SWISSMap(rs._Reader):
 
         maps, bboxs = rs.read_raster(path=paths, epsg=epsg, bbox=bbox,
                                      align=True, *args, **kwargs)
-        mapping = dict(zip(names, maps))
 
+        mapping = dict(zip(names, maps))
         return xr.Dataset(mapping), bboxs
 
 

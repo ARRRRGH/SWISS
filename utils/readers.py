@@ -36,6 +36,11 @@ def rasterio_to_gtiff_xarray(arr, meta, path='.', *args, **kwargs):
     with rio.open(tmp_path, 'w', **meta) as fil2:
         fil2.write(arr)
     out = xr.open_rasterio(tmp_path, *args, **kwargs)
+
+    out = out.squeeze('band', drop=True)
+    out = out.where(out != out.attrs['nodatavals'][0])
+    out.attrs['nodatavals'] = np.nan
+
     os.remove(tmp_path)
     return out
 
@@ -76,7 +81,8 @@ class ICESATReader(_Reader):
              'delta_time': '/land_ice_segments/delta_time',
              'q_flag': '/land_ice_segments/atl06_quality_summary',
              't_ref': '/ancillary_data/atlas_sdp_gps_epoch',
-             'segment_id': '/land_ice_segments/segment_id'}
+             'segment_id': '/land_ice_segments/segment_id',
+             'rgt': '/orbit_info/rgt'}
 
     atl08 = {'lat': '/land_segments/latitude',
              'lon': '/land_segments/longitude',
@@ -85,7 +91,8 @@ class ICESATReader(_Reader):
              'delta_time': '/land_segments/delta_time',
              'q_flag': '/land_segments/dem_removal_flag',
              't_ref': '/ancillary_data/atlas_sdp_gps_epoch',
-             'segment_id': '/land_ice_segments/segment_id'}
+             'segment_id': '/land_ice_segments/segment_id',
+             'rgt': '/orbit_info/rgt'}
 
     keywords = {(2, 6): atl06, (2, 8): atl08}
 
@@ -145,6 +152,7 @@ class ICESATReader(_Reader):
                     t_dt = fi[g + self.dict['delta_time']][:]
                     q_flag = fi[g + self.dict['q_flag']][:]
                     t_ref = fi[self.dict['t_ref']][:]
+                    rgt = fi[self.dict['rgt']][:]
 
                     for v in values:
                         try:
@@ -210,6 +218,7 @@ class ICESATReader(_Reader):
                 custom_vars['q_flg'] = q_flag
                 custom_vars['ascending'] = i_asc
                 custom_vars['ground_track_id'] = [g] * len(lon)
+                custom_vars['rgt'] = rgt * np.ones(len(lat))
 
                 if out:
                     # Define output file name
@@ -222,7 +231,7 @@ class ICESATReader(_Reader):
                     fil.close()
 
                 f = pd.DataFrame(custom_vars)
-                df = pd.concat((df, f), sort=True)
+                df = pd.concat((df, f), sort=True).reset_index(drop=True)
 
         # create GeoPandas DataFrame for proper registering
         if not df.empty:
