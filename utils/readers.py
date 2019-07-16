@@ -10,7 +10,7 @@ import geopandas as gpd
 import os
 import h5py
 import rasterio as rio
-from shapely.geometry import Point, GeometryCollection
+from shapely.geometry import Point, GeometryCollection, MultiPoint
 from astropy.time import Time
 import glob
 import numpy as np
@@ -19,15 +19,14 @@ import re
 from rasterio.mask import mask
 from joblib import Parallel, delayed
 from . import base_data_structures as bs
+from . import helpers as hp
+
 import xarray as xr
-from rasterio.io import MemoryFile
 import uuid
-import affine
 from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 
-from dateutil import parser
 from fiona.crs import from_epsg
 
 
@@ -102,7 +101,7 @@ class ICESATReader(_Reader):
         self.prod_nr = prod_nr
         self.dict = self.keywords[(self.mission, self.prod_nr)]
 
-    def query(self, n_jobs=2, time=None, segments=None, bbox=None, *args, **kwargs):
+    def query(self, n_jobs=2, time=None, segments=None, bbox=None, hull=False, alpha=.1, buffer=.1, *args, **kwargs):
         """
         Reads the icesat data files according to the query specifications.
         """
@@ -114,7 +113,14 @@ class ICESATReader(_Reader):
         dfs, bboxs = zip(*Parallel(n_jobs=n_jobs,
                                    verbose=5)(delayed(self._read)(f, bbox=bbox, *args, **kwargs) for f in fnames))
 
-        return pd.concat(dfs), bboxs
+        dframe, bbox = pd.concat(dfs), bboxs[0]
+
+        if hull:
+            convex_hull, edge_points = hp.concave_hull(dframe.geometry, alpha=alpha)
+            epsg = hp.get_epsg_from_geopandas(dframe)
+            return dframe, bs.BBox(bbox=convex_hull.buffer(buffer), epsg=epsg, res=bbox.get_resolution(epsg))
+
+        return dframe, bbox
 
     def _read(self, fnames, bbox=None, quality=0, out=False, values=[], epsg=None, *args, **kwargs):
         """ Params
@@ -210,10 +216,10 @@ class ICESATReader(_Reader):
                 # Save variables
                 custom_vars['x'] = lon
                 custom_vars['y'] = lat
-                custom_vars['h_elv'] = h
+                custom_vars['height'] = h
                 custom_vars['time'] = time
                 custom_vars['t_sec'] = t_gps
-                custom_vars['t_iso'] = t_iso
+                custom_vars['time'] = t_iso
                 custom_vars['s_elv'] = s_li
                 custom_vars['q_flg'] = q_flag
                 custom_vars['ascending'] = i_asc
@@ -232,6 +238,9 @@ class ICESATReader(_Reader):
 
                 f = pd.DataFrame(custom_vars)
                 df = pd.concat((df, f), sort=True).reset_index(drop=True)
+
+                # create proper datetime index
+                df['time'] = pd.to_datetime(df['time'])
 
         # create GeoPandas DataFrame for proper registering
         if not df.empty:
@@ -352,7 +361,8 @@ class _RasterReader(_Reader):
         out_bboxs = []
 
         if align:
-            assert bbox is not None
+            if bbox is None:
+                bbox = bs.BBox.from_tif(paths[0])
             for path in paths:
                 # crop tif and save to tmp file
                 _, tmp_path = self._crop_tif(path, bbox=bbox, to_file=True)
@@ -375,24 +385,13 @@ class _RasterReader(_Reader):
                         out = xr.open_rasterio(fil, *args, **kwargs)
 
                     # make bbox that is returned
-                    bbox = self._get_bbox_from_tif(path)
+                    bbox = bs.BBox.from_tif(path)
 
                 out.attrs['path'] = path
                 out_xarrs.append(out)
                 out_bboxs.append(bbox)
 
         return out_xarrs, out_bboxs
-
-    def _get_bbox_from_tif(self, path):
-        with rio.open(path) as fil:
-            bbox = fil.bounds
-            fil_epsg = rio.crs.CRS.to_epsg(fil.crs)
-
-            bbox = bs.BBox.from_rasterio_bbox(bbox, fil_epsg)
-
-            res = fil.res
-            bbox.set_resolution(res, fil_epsg)
-        return bbox
 
     def _crop_tif(self, path, bbox, to_file=False):
         with rio.open(path) as fil:
@@ -422,9 +421,9 @@ class _RasterReader(_Reader):
         left, bottom, right, top = bbox.get_bounds(epsg=epsg)
         res = bbox.get_resolution(epsg)
 
-        height = (right - left) // res[0]
-        width = (top - bottom) // res[1]
-        dst_transform = rio.transform.from_origin(west=left, north=top, xsize=res[0], ysize=res[0])
+        width = (right - left) // res[0]
+        height = (top - bottom) // res[1]
+        dst_transform = rio.transform.from_origin(west=left, north=top, xsize=res[0], ysize=res[1])
 
         vrt_options = {
             'resampling': Resampling.cubic,
@@ -548,8 +547,9 @@ class SLFReader(_Reader):
         slf['stat_abk'] = slf['stat_abk'].map(str) + slf['stao_nr'].map(str)
         slf.drop(columns=['stao_nr'])
 
-        slf['datetime'] = pd.to_datetime(slf['datetime [utc+1]'].map(str), format='%Y%m%d%H%M%S', errors='coerce')
+        slf['time'] = pd.to_datetime(slf['datetime [utc+1]'].map(str), format='%Y%m%d%H%M%S', errors='coerce')
         slf.drop(columns='datetime [utc+1]')
+        slf['time'] = pd.to_datetime(slf['time'])
 
         # convert time series data to gpd.GeoDataFrame by adding location info
         slf['height'] = [slf_codes[code]['height'] if code in slf_codes else np.nan for code in slf['stat_abk']]
@@ -576,10 +576,10 @@ class SLFReader(_Reader):
         if time is not None:
             start, end = time
             if start is not None:
-                time_idx = df[df['datetime'] < start].index
+                time_idx = df[df['time'] < start].index
                 df.drop(time_idx, inplace=True)
             if end is not None:
-                time_idx = df[df['datetime'] > end].index
+                time_idx = df[df['time'] > end].index
                 df.drop(time_idx, inplace=True)
         return df
 

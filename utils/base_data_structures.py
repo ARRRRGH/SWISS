@@ -1,20 +1,27 @@
 import geopandas as gpd
 from fiona.crs import from_epsg
 from shapely.geometry import box, Point, mapping
-
+import rasterio as rio
+import shapely as shp
 import json
 
 
 class BBox(object):
     def __init__(self, bbox, epsg=4326, res=None):
-        assert type(bbox) == tuple
-
         self._epsg = epsg
-        bbox = box(*bbox)
-        self.df = gpd.GeoDataFrame({'geometry': bbox}, index=[0], crs=from_epsg(epsg))
+        if type(bbox) == tuple and len(bbox) == 4:
+            shape = box(*bbox)
+        elif type(bbox) == shp.geometry.polygon.Polygon:
+            shape = bbox
+        else:
+            raise ValueError('bbox must be a quadruple or a shapely dict')
+
+        self.df = gpd.GeoDataFrame({'geometry': shape}, index=[0], crs=from_epsg(epsg))
 
         if res is None:
             self._res = 1, 1
+        else:
+            self._res = res
 
     @property
     def epsg(self):
@@ -35,14 +42,15 @@ class BBox(object):
         left, bottom, right, top = self.get_bounds()
 
         mid_point_coords = (left + right) // 2, (top + bottom) // 2
-        ref_point_coords = mid_point_coords[0] + self._res[0], mid_point_coords[1] + self._res[1]
-        pts = [Point(coords) for coords in (mid_point_coords, ref_point_coords)]
+        refx_point_coords = mid_point_coords[0] + self._res[0], mid_point_coords[1]
+        refy_point_coords = mid_point_coords[0], mid_point_coords[1]  + self._res[1]
+        pts = [Point(coords) for coords in (mid_point_coords, refx_point_coords, refy_point_coords)]
 
         df = gpd.GeoDataFrame({'geometry': pts}, crs=from_epsg(self.epsg))
         df = df.to_crs(epsg=epsg)
         pts = df['geometry']
 
-        return abs(pts[1].coords[0][0] - pts[0].coords[0][0]), abs(pts[1].coords[0][1] - pts[0].coords[0][1])
+        return abs(pts[1].coords[0][0] - pts[0].coords[0][0]), abs(pts[2].coords[0][1] - pts[0].coords[0][1])
 
     def _get(self, epsg=None):
         if epsg is not None:
@@ -58,6 +66,7 @@ class BBox(object):
             df = self.df.to_crs(crs=crs)
         else:
             df = self.df
+        # return [f['geometry'] for f in json.loads(df.to_json())['features']]
         return [mapping(df['geometry'][0])]
 
     def to_xlim(self, epsg=None):
@@ -71,3 +80,15 @@ class BBox(object):
     @staticmethod
     def from_rasterio_bbox(bbox, epsg):
         return BBox((bbox.left, bbox.bottom, bbox.right, bbox.top), epsg)
+
+    @staticmethod
+    def from_tif(path):
+        with rio.open(path) as fil:
+            bbox = fil.bounds
+            fil_epsg = rio.crs.CRS.to_epsg(fil.crs)
+
+            bbox = BBox.from_rasterio_bbox(bbox, fil_epsg)
+
+            res = fil.res
+            bbox.set_resolution(res, fil_epsg)
+        return bbox
