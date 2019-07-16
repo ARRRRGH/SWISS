@@ -113,7 +113,7 @@ class ICESATReader(_Reader):
         dfs, bboxs = zip(*Parallel(n_jobs=n_jobs,
                                    verbose=5)(delayed(self._read)(f, bbox=bbox, *args, **kwargs) for f in fnames))
 
-        dframe, bbox = pd.concat(dfs), bboxs[0]
+        dframe, bbox = pd.concat(dfs).reset_index(drop=True), bboxs[0]
 
         if hull:
             convex_hull, edge_points = hp.concave_hull(dframe.geometry, alpha=alpha)
