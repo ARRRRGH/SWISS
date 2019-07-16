@@ -1,22 +1,24 @@
 import geopandas as gpd
 from fiona.crs import from_epsg
-from shapely.geometry import box, Point, mapping
+from shapely.geometry import box, Point, mapping, MultiPolygon
 import rasterio as rio
 import shapely as shp
-import json
-
+import xarray as xr
 
 class BBox(object):
     def __init__(self, bbox, epsg=4326, res=None):
         self._epsg = epsg
         if type(bbox) == tuple and len(bbox) == 4:
-            shape = box(*bbox)
+            shape = [box(*bbox)]
         elif type(bbox) == shp.geometry.polygon.Polygon:
-            shape = bbox
+            shape = [bbox]
+        elif type(bbox) == shp.geometry.MultiPolygon:
+            shape = [p for p in bbox]
         else:
-            raise ValueError('bbox must be a quadruple or a shapely dict')
+            raise ValueError('bbox must be a quadruple or a shapely.geometry.polygon '
+                             'or shapely.geometry.MultiplePolygon')
 
-        self.df = gpd.GeoDataFrame({'geometry': shape}, index=[0], crs=from_epsg(epsg))
+        self.df = gpd.GeoDataFrame({'geometry': shape}, crs=from_epsg(epsg))
 
         if res is None:
             self._res = 1, 1
@@ -58,7 +60,7 @@ class BBox(object):
         return self.df
 
     def get_bounds(self, epsg=None):
-        return self._get(epsg=epsg)['geometry'][0].bounds
+        return MultiPolygon([p for p in self._get(epsg=epsg)['geometry']]).bounds
 
     def get_rasterio_coords(self, crs=None):
         # https://automating-gis-processes.github.io/CSC18/lessons/L6/clipping-raster.html
@@ -67,7 +69,7 @@ class BBox(object):
         else:
             df = self.df
         # return [f['geometry'] for f in json.loads(df.to_json())['features']]
-        return [mapping(df['geometry'][0])]
+        return [mapping(geom) for geom in df['geometry']]
 
     def to_xlim(self, epsg=None):
         bounds = self.get_bounds(epsg)
