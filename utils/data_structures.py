@@ -1,7 +1,8 @@
 import datetime as dt
-from . import readers as rs
 import xarray as xr
 
+from . import readers as rs
+from . import helpers as hp
 
 
 class SWISSMap(rs._Reader):
@@ -25,13 +26,7 @@ class SWISSMap(rs._Reader):
         self.slf_reader = rs.SLFReader(slf_path, bbox=bbox, time=time, *args, **kwargs)
 
     def query(self, time=None, bbox=None, segments=None, epsg=3857, *args, **kwargs):
-        if time is not None:
-            start, end = time
-            if type(start) is str:
-                start = dt.datetime.fromisoformat(start)
-            if type(end) is str:
-                end = dt.datetime.fromisoformat(end)
-            time = start, end
+        time = self._convert_time_to_datetime(time)
 
         # Read variables, make sure that, in case no bbox is supplied, data are aligned
         # by overriding bbox
@@ -60,3 +55,17 @@ class SWISSMap(rs._Reader):
 
         mapping = dict(zip(names, maps))
         return xr.Dataset(mapping), bbox
+
+    def _convert_time_to_datetime(self, time):
+        if time is not None:
+            start, end = time
+            if type(start) is str:
+                start = dt.datetime.fromisoformat(start)
+            if type(end) is str:
+                end = dt.datetime.fromisoformat(end)
+            time = start, end
+        return time
+
+    def query_table(self, time=None, bbox=None, segments=None, epsg=3857, *args, **kwargs):
+        ice_data, bbox = self.icesat_reader.query(time=time, bbox=bbox, segments=segments, epsg=epsg, *args, **kwargs)
+        _ = hp.raster_to_point(ice_data, qmap)
