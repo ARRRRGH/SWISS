@@ -74,14 +74,14 @@ def raster_to_point(dframe, xset, method='nearest', radius_of_influence=1000, in
                                                           pad_lo=np.datetime64('1970-01-01'),
                                                           pad_hi=np.datetime64('now'))
 
-                _time_binned_swaths = {i: pyr.geometry.SwathDefinition(dfi.y, dfi.x)
+                _time_binned_swaths = {i: pyr.geometry.SwathDefinition(lats=dfi.y, lons=dfi.x)
                                        for i, dfi in _time_binned_dframes.items()}
 
             # prepare column for time_delta
             dframe[var + '_time_delta'] = np.nan
             dframe[var + '_time_ind'] = np.nan
 
-            times = [(xset[var].isel(time=i),
+            times = [(xset[var].isel(time=i).data,
                       _time_binned_dframes[i],
                       _time_binned_swaths[i],
                       i)
@@ -93,7 +93,7 @@ def raster_to_point(dframe, xset, method='nearest', radius_of_influence=1000, in
             if swath is None:
                 swath = pyr.geometry.SwathDefinition(lats=dframe.y, lons=dframe.x)
 
-            times = [(xset[var], dframe, swath, None)]
+            times = [(xset[var].data, dframe, swath, None)]
 
         # Iterate over all times
         dframe[var] = np.nan
@@ -103,7 +103,7 @@ def raster_to_point(dframe, xset, method='nearest', radius_of_influence=1000, in
 
             data = resample_func(source_geo_def=grid,
                                  target_geo_def=swath_at_t,
-                                 data=var_at_t.data,
+                                 data=var_at_t,
                                  radius_of_influence=radius_of_influence,
                                  *args, **kwargs)
 
@@ -112,10 +112,8 @@ def raster_to_point(dframe, xset, method='nearest', radius_of_influence=1000, in
                 xset_time = xset.coords['time'][time_ind].data
                 time_delta = dframe_at_t.time.astype(np.datetime64).subtract(xset_time)
 
-                dframe.loc[dframe_at_t.index,
-                           var + '_time_delta'] = time_delta
-                dframe.loc[dframe_at_t.index,
-                           var + '_time_ind'] = time_ind
+                dframe.loc[dframe_at_t.index, var + '_time_delta'] = time_delta
+                dframe.loc[dframe_at_t.index, var + '_time_ind'] = time_ind
     return dframe
 
 
