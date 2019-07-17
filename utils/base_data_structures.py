@@ -3,7 +3,7 @@ from fiona.crs import from_epsg
 from shapely.geometry import box, Point, mapping, MultiPolygon
 import rasterio as rio
 import shapely as shp
-import xarray as xr
+
 
 class BBox(object):
     def __init__(self, bbox, epsg=4326, res=None):

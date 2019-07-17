@@ -10,7 +10,7 @@ import geopandas as gpd
 import os
 import h5py
 import rasterio as rio
-from shapely.geometry import Point, GeometryCollection, MultiPoint
+from shapely.geometry import Point, GeometryCollection
 from astropy.time import Time
 import glob
 import numpy as np
@@ -29,27 +29,23 @@ from rasterio.vrt import WarpedVRT
 
 from fiona.crs import from_epsg
 
+from tqdm import tqdm
 
-def rasterio_to_gtiff_xarray(arr, meta, path='.', *args, **kwargs):
-    tmp_path = os.path.join(path, '%s.tmp.tif' % str(uuid.uuid4()))
+
+def rasterio_to_xarray(arr, meta, tmp_dir='.', chunks=None, remove=True, *args, **kwargs):
+    tmp_path = os.path.join(tmp_dir, '%s.tmp.tif' % str(uuid.uuid4()))
     with rio.open(tmp_path, 'w', **meta) as fil2:
         fil2.write(arr)
-    out = xr.open_rasterio(tmp_path, *args, **kwargs)
+    out = xr.open_rasterio(tmp_path, chunks=chunks)
 
     out = out.squeeze('band', drop=True)
     out = out.where(out != out.attrs['nodatavals'][0])
     out.attrs['nodatavals'] = np.nan
 
-    os.remove(tmp_path)
-    return out
+    if chunks is None and remove or remove:
+        os.remove(tmp_path)
 
-#
-# def rasterio_to_gtiff_xarray(arr, meta, path='.', *args, **kwargs):
-#     with MemoryFile() as memfile:
-#         with memfile.open(**meta) as dataset:
-#             dataset.write(arr, 1)
-#         out = xr.open_rasterio(memfile, *args, **kwargs)
-#     return out
+    return out, tmp_path
 
 
 class _Reader(object):
@@ -111,13 +107,13 @@ class ICESATReader(_Reader):
         fnames = glob.glob(os.path.join(self.path, '*.h5'))
         fnames = np.array_split(self.select_files(fnames, time=time, segments=segments), n_jobs)
         dfs, bboxs = zip(*Parallel(n_jobs=n_jobs,
-                                   verbose=5)(delayed(self._read)(f, bbox=bbox, *args, **kwargs) for f in fnames))
+                                   verbose=5)(delayed(self._read)(f, bbox=bbox, *args, **kwargs) for f in tqdm(fnames)))
 
         dframe, bbox = pd.concat(dfs).reset_index(drop=True), bboxs[0]
 
         if hull:
             convex_hull, edge_points = hp.concave_hull(dframe.geometry, alpha=alpha)
-            epsg = hp.get_epsg_from_geopandas(dframe)
+            epsg = hp.get_epsg_from_string(dframe)
             return dframe, bs.BBox(bbox=convex_hull.buffer(buffer), epsg=epsg, res=bbox.get_resolution(epsg))
 
         return dframe, bbox
@@ -340,9 +336,8 @@ class _RasterReader(_Reader):
     def __init__(self, path, bbox=None, time=None, *args, **kwargs):
         _Reader.__init__(self, path, bbox=bbox, time=time)
 
-    def read(self, paths=None, bbox=None, align=True, epsg=4326, *args, **kwargs):
+    def read(self, paths=None, bbox=None, align=True, epsg=4326, chunks=None, *args, **kwargs):
         """
-        Read rasters in paths constrained by bbox. No resampling and alignment is performed.
         :param paths:
         :param bbox:
         :param args:
@@ -363,37 +358,40 @@ class _RasterReader(_Reader):
         if align:
             if bbox is None:
                 bbox = bs.BBox.from_tif(paths[0])
-            for path in paths:
+            for path in tqdm(paths):
                 # crop tif and save to tmp file
-                _, tmp_path = self._crop_tif(path, bbox=bbox, to_file=True)
+                _, tmp_path = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, remove=False, *args, **kwargs)
 
                 # warp image
-                out = self._warp_tif(tmp_path, bbox=bbox, epsg=epsg)
+                out, _ = _RasterReader._warp_tif(tmp_path, bbox=bbox, epsg=epsg, chunks=chunks, *args, **kwargs)
 
-                os.remove(tmp_path)
+                # if chunks is not None, a dask array is used and tmp_file is not removed in rasterio_to_xarray
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
                 out.attrs['path'] = path
                 out_xarrs.append(out)
                 out_bboxs.append(bbox)
 
         else:
-            for path in paths:
+            for path in tqdm(paths):
                 if bbox is not None:
-                    out, _ = self._crop_tif(path, bbox=bbox, to_file=False)
+                    out, _ = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, *args, **kwargs)
                 else:
                     with rio.open(path, 'r') as fil:
-                        out = xr.open_rasterio(fil, *args, **kwargs)
+                        out = xr.open_rasterio(fil, chunks=chunks)
 
-                    # make bbox that is returned
-                    bbox = bs.BBox.from_tif(path)
+                # make bbox that is returned
+                out_bbox = bs.BBox.from_tif(path)
 
                 out.attrs['path'] = path
                 out_xarrs.append(out)
-                out_bboxs.append(bbox)
+                out_bboxs.append(out_bbox)
 
         return out_xarrs, out_bboxs
 
-    def _crop_tif(self, path, bbox, to_file=False):
+    @staticmethod
+    def _crop_tif(path, bbox, tmpdir='.', *args, **kwargs):
         with rio.open(path) as fil:
             coords = bbox.get_rasterio_coords(fil.crs.data)
             out_img, out_transform = mask(dataset=fil, shapes=coords, crop=True)
@@ -406,18 +404,15 @@ class _RasterReader(_Reader):
                              "count": fil.count,
                              "dtype": out_img.dtype})
 
-        tmp_path = os.path.join('.', '%s.tmp.tif' % str(uuid.uuid4()))
+        tmp_path = os.path.join(tmpdir, '%s.tmp.tif' % str(uuid.uuid4()))
         with rio.open(tmp_path, 'w', **out_meta) as fil:
             fil.write(out_img)
 
-        if to_file:
-            return None, tmp_path
-        else:
-            out = rasterio_to_gtiff_xarray(out_img, out_meta)
-            os.remove(tmp_path)
-            return out, None
+        out, tmp_path = rasterio_to_xarray(out_img, out_meta, *args, **kwargs)
+        return out, tmp_path
 
-    def _warp_tif(self, path, bbox, epsg, *args, **kwargs):
+    @staticmethod
+    def _warp_tif(path, bbox, epsg, *args, **kwargs):
         left, bottom, right, top = bbox.get_bounds(epsg=epsg)
         res = bbox.get_resolution(epsg)
 
@@ -449,10 +444,19 @@ class _RasterReader(_Reader):
                                  "transform": dst_transform,
                                  "count": vrt.count})
 
-                xarr = rasterio_to_gtiff_xarray(dta, vrt_meta, *args, **kwargs)
+                xarr, tmp_path = rasterio_to_xarray(dta, vrt_meta, *args, **kwargs)
 
-        return xarr
+        return xarr, tmp_path
 
+    def query(self, time=None, bbox=None, n_jobs=2, epsg=None, *args, **kwargs):
+        ret, bbox = self.read(time=time, bbox=bbox, n_jobs=n_jobs, epsg=epsg, *args, **kwargs)
+
+        # if epsg is set, change coordinates
+        # fixme: incorrect transformation ?
+        if epsg is not None:
+            ret = [hp.xarray_to_epsg(r, epsg) for r in ret]
+
+        return ret, bbox
 
 class _TimeRasterReader(_RasterReader):
     """
@@ -467,7 +471,22 @@ class _TimeRasterReader(_RasterReader):
         self.min_time = min(self._path_dict.values())
         self.max_time = max(self._path_dict.values())
 
-    def query(self, bbox=None, time=None, align=False, *args, **kwargs):
+    def query(self, bbox=None, time=None, align=False, epsg=None, *args, **kwargs):
+        paths, times = self._prepare_query(bbox=bbox, time=time)
+        arrs, bboxs = self.read(paths, bbox=bbox, align=align, epsg=epsg, *args, **kwargs)
+
+        ret = xr.concat(arrs, 'time')
+        ret.coords['time'] = ('time', np.array(times))
+        ret = ret.sortby('time')
+
+        # if epsg is set, change coordinates
+        # fixme: incorrect transformation ?
+        if epsg is not None:
+            ret = hp.xarray_to_epsg(ret, epsg)
+
+        return ret, bboxs
+
+    def _prepare_query(self, bbox=None, time=None, *args, **kwargs):
         bbox = self._which_bbox(bbox)
         time = self._which_time(time)
 
@@ -485,12 +504,7 @@ class _TimeRasterReader(_RasterReader):
             return None, [bbox]
 
         paths, times = zip(*pathes_times)
-        arrs, bboxs = self.read(paths, bbox=bbox, align=True, *args, **kwargs)
-
-        ret = xr.concat(arrs, 'time')
-        ret.coords['time'] = ('time', np.array(times))
-
-        return ret, bboxs
+        return paths, times
 
     def _create_path_dict(self):
         pass
@@ -513,7 +527,7 @@ class SnowCoverReader(_TimeRasterReader):
 
 
 def read_raster(path, bbox=None, *args, **kwargs):
-    return _RasterReader(path, bbox).read(*args, **kwargs)
+    return _RasterReader(path, bbox).query(*args, **kwargs)
 
 
 class SLFReader(_Reader):
@@ -555,7 +569,7 @@ class SLFReader(_Reader):
         slf['height'] = [slf_codes[code]['height'] if code in slf_codes else np.nan for code in slf['stat_abk']]
         geometry = [slf_codes[code]['geometry'] if code in slf_codes else GeometryCollection() for code in slf['stat_abk']]
 
-        return gpd.GeoDataFrame(slf, crs=from_epsg(4326), geometry=geometry), slf_codes
+        return gpd.GeoDataFrame(slf, crs=from_epsg(2056), geometry=geometry), slf_codes
 
     def query(self, time=None, bbox=None, epsg=None, *args, **kwargs):
         time = self._which_time(time)
@@ -563,6 +577,7 @@ class SLFReader(_Reader):
 
         # take out measurements that are not time frame
         slf = self._filter_time(self._cached_slf_data, time)
+        slf.reset_index(drop=True)
 
         # take out measurements that are not in bbox
         slf = self._filter_bbox(slf, bbox)
@@ -585,7 +600,8 @@ class SLFReader(_Reader):
 
     def _filter_bbox(self, df, bbox):
         if bbox is not None:
-            df = df.to_crs(bbox.df.crs)
+            print(bbox.epsg, df.geometry, bbox.df.geometry)
+            df = df.to_crs(epsg=bbox.epsg)
             df = gpd.sjoin(df, bbox.df, how='left')
         return df
 
