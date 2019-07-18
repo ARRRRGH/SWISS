@@ -24,7 +24,7 @@ def geopandas_to_numpy(geometries):
 def xarray_to_epsg(xset, epsg):
     this_epsg = get_epsg_from_string(xset.attrs['crs'])
 
-    if epsg == this_epsg:
+    if epsg is None or epsg == this_epsg:
         return xset
 
     ptsx = [Point(x, xset.coords['y'].data[0]) for x in xset.coords['x'].data]
@@ -140,7 +140,7 @@ def raster_to_point(dframe, xset, method='nearest', radius_of_influence=1000, in
 
             arrs = list(time_dep_arrs) + list(time_indep_arrs)
             if len(arrs) > 1:
-                data_at_t = da.stack([np.array(a) for a in arrs], axis=2)
+                data_at_t = da.stack([a for a in arrs], axis=2)
                 data_at_t = np.array(data_at_t)
             else:
                 data_at_t = np.array(arrs[0])
@@ -177,9 +177,8 @@ def raster_to_point(dframe, xset, method='nearest', radius_of_influence=1000, in
         time_indep_vars, time_indep_arrs = zip(*time_indeps)
         arrs = list(time_indep_arrs)
 
-        print(len(arrs), arrs)
         if len(arrs) > 1:
-            vars = da.stack([np.array(a) for a in arrs], axis=2)
+            vars = da.stack([a for a in arrs], axis=2)
             vars = np.array(vars)
         else:
             vars = np.array(arrs[0])

@@ -32,17 +32,21 @@ from fiona.crs import from_epsg
 from tqdm import tqdm
 
 
-def rasterio_to_xarray(arr, meta, tmp_dir='.', chunks=None, remove=True, *args, **kwargs):
-    tmp_path = os.path.join(tmp_dir, '%s.tmp.tif' % str(uuid.uuid4()))
+def rasterio_to_xarray(arr, meta, tmp_dir='.', fil_name=None, chunks=None, remove=True, *args, **kwargs):
+    if fil_name is None:
+        fil_name = str(uuid.uuid4())
+    else:
+        fil_name = 'tmp__' + fil_name
+    tmp_path = os.path.join(tmp_dir, '%s' % fil_name)
     with rio.open(tmp_path, 'w', **meta) as fil2:
         fil2.write(arr)
     out = xr.open_rasterio(tmp_path, chunks=chunks)
 
     out = out.squeeze('band', drop=True)
-    out = out.where(out != out.attrs['nodatavals'][0])
-    out.attrs['nodatavals'] = np.nan
+    # out = out.where(out != out.attrs['nodatavals'][0])
+    # out.attrs['nodatavals'] = np.nan
 
-    if chunks is None and remove or remove:
+    if chunks is None and remove:
         os.remove(tmp_path)
 
     return out, tmp_path
@@ -359,15 +363,15 @@ class _RasterReader(_Reader):
             if bbox is None:
                 bbox = bs.BBox.from_tif(paths[0])
             for path in tqdm(paths):
+                fil_name = os.path.basename(path)
+
                 # crop tif and save to tmp file
-                _, tmp_path = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, remove=False, *args, **kwargs)
+                _, tmp_path = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, remove=False, fil_name=fil_name,
+                                                      *args, **kwargs)
 
                 # warp image
-                out, _ = _RasterReader._warp_tif(tmp_path, bbox=bbox, epsg=epsg, chunks=chunks, *args, **kwargs)
-
-                # if chunks is not None, a dask array is used and tmp_file is not removed in rasterio_to_xarray
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                out, _ = _RasterReader._warp_tif(tmp_path, bbox=bbox, epsg=epsg, chunks=chunks, fil_name=fil_name,
+                                                 *args, **kwargs)
 
                 out.attrs['path'] = path
                 out_xarrs.append(out)
@@ -375,8 +379,10 @@ class _RasterReader(_Reader):
 
         else:
             for path in tqdm(paths):
+                fil_name = os.path.basename(path)
                 if bbox is not None:
-                    out, _ = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, *args, **kwargs)
+                    out, _ = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, fil_name=fil_name,
+                                                     *args, **kwargs)
                 else:
                     with rio.open(path, 'r') as fil:
                         out = xr.open_rasterio(fil, chunks=chunks)
@@ -391,7 +397,7 @@ class _RasterReader(_Reader):
         return out_xarrs, out_bboxs
 
     @staticmethod
-    def _crop_tif(path, bbox, tmpdir='.', *args, **kwargs):
+    def _crop_tif(path, bbox, tmp_dir='.', fil_name=None, *args, **kwargs):
         with rio.open(path) as fil:
             coords = bbox.get_rasterio_coords(fil.crs.data)
             out_img, out_transform = mask(dataset=fil, shapes=coords, crop=True)
@@ -404,15 +410,20 @@ class _RasterReader(_Reader):
                              "count": fil.count,
                              "dtype": out_img.dtype})
 
-        tmp_path = os.path.join(tmpdir, '%s.tmp.tif' % str(uuid.uuid4()))
-        with rio.open(tmp_path, 'w', **out_meta) as fil:
-            fil.write(out_img)
+        # tmp_path = os.path.join(tmp_dir, '%s.tmp' % str(uuid.uuid4()))
+        # with rio.open(tmp_path, 'w', **out_meta) as fil:
+        #     fil.write(out_img)
 
-        out, tmp_path = rasterio_to_xarray(out_img, out_meta, *args, **kwargs)
+        out, tmp_path = rasterio_to_xarray(out_img, out_meta, tmp_dir=tmp_dir,
+                                           fil_name=fil_name, *args, **kwargs)
+
+        # if os.path.exists(tmp_path):
+        #     os.remove(tmp_path)
+
         return out, tmp_path
 
     @staticmethod
-    def _warp_tif(path, bbox, epsg, *args, **kwargs):
+    def _warp_tif(path, bbox, epsg, tmp_dir='.', fil_name=None, *args, **kwargs):
         left, bottom, right, top = bbox.get_bounds(epsg=epsg)
         res = bbox.get_resolution(epsg)
 
@@ -444,19 +455,21 @@ class _RasterReader(_Reader):
                                  "transform": dst_transform,
                                  "count": vrt.count})
 
-                xarr, tmp_path = rasterio_to_xarray(dta, vrt_meta, *args, **kwargs)
+                xarr, tmp_path = rasterio_to_xarray(dta, vrt_meta, tmp_dir=tmp_dir,
+                                                    fil_name=fil_name, *args, **kwargs)
 
         return xarr, tmp_path
 
-    def query(self, time=None, bbox=None, n_jobs=2, epsg=None, *args, **kwargs):
-        ret, bbox = self.read(time=time, bbox=bbox, n_jobs=n_jobs, epsg=epsg, *args, **kwargs)
+    def query(self, time=None, bbox=None, n_jobs=2, epsg=None, align=False, *args, **kwargs):
+        ret, bbox = self.read(time=time, bbox=bbox, n_jobs=n_jobs, epsg=epsg, align=align, *args, **kwargs)
 
         # if epsg is set, change coordinates
         # fixme: incorrect transformation ?
-        if epsg is not None:
+        if epsg is not None and not align:
             ret = [hp.xarray_to_epsg(r, epsg) for r in ret]
 
         return ret, bbox
+
 
 class _TimeRasterReader(_RasterReader):
     """
@@ -481,7 +494,7 @@ class _TimeRasterReader(_RasterReader):
 
         # if epsg is set, change coordinates
         # fixme: incorrect transformation ?
-        if epsg is not None:
+        if epsg is not None and not align:
             ret = hp.xarray_to_epsg(ret, epsg)
 
         return ret, bboxs

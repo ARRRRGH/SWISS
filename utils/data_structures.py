@@ -28,24 +28,33 @@ class SWISSMap(rs._Reader):
         self.icesat_reader = rs.ICESATReader(ice_path, bbox=bbox, time=time, *args, **kwargs)
         self.slf_reader = rs.SLFReader(slf_path, bbox=bbox, time=time, *args, **kwargs)
 
-    def query(self, time=None, bbox=None, segments=None, epsg=3857, query_dir=None, *args, **kwargs):
+    def query(self, time=None, bbox=None, segments=None, epsg=3857, *args, **kwargs):
         time = self._convert_time_to_datetime(time)
 
-        if query_dir is None:
-            dirfmt = r'query-%4d-%02d-%02d-%02d-%02d-%02d'
-            now = tim.localtime()[0:6]
-            query_dir = os.path.join(self.calc_dir, dirfmt % now)
-            if not os.path.exists(query_dir):
-                os.makedirs(query_dir)
+        dir_fmt = r'query-%4d-%02d-%02d-%02d-%02d-%02d'
+        now = tim.localtime()[0:6]
+
+        query_dir = os.path.join(self.calc_dir, dir_fmt % now)
+        snow_query_dir = os.path.join(query_dir, 'snow_data')
+        qmap_query_dir = os.path.join(query_dir, 'qmap_data')
+
+        if not os.path.exists(query_dir):
+            os.makedirs(query_dir)
+            os.makedirs(snow_query_dir)
+            os.makedirs(qmap_query_dir)
 
         # Read variables, make sure that, in case no bbox is supplied, data are aligned
         # by overriding bbox
         ice_data, bbox = self.icesat_reader.query(time=time, bbox=bbox, segments=segments,
-                                                  epsg=epsg, tmpdir=query_dir, *args, **kwargs)
+                                                  epsg=epsg, *args, **kwargs)
 
-        snow_data, _ = self.snow_cover_reader.query(time=time, bbox=bbox, epsg=epsg, tmpdir=query_dir, *args, **kwargs)
-        qmap, _ = self._get_time_invariant_map(bbox=bbox, epsg=epsg, tmpdir=query_dir, *args, **kwargs)
-        # slf_data, _ = self.slf_reader.query(time=time, bbox=bbox, epsg=epsg, tmpdir=query_dir, *args, **kwargs)
+        snow_data, _ = self.snow_cover_reader.query(time=time, bbox=bbox, epsg=epsg, tmp_dir=snow_query_dir,
+                                                    *args, **kwargs)
+
+        qmap, _ = self._get_time_invariant_map(bbox=bbox, epsg=epsg, tmp_dir=qmap_query_dir,
+                                               *args, **kwargs)
+
+        # slf_data, _ = self.slf_reader.query(time=time, bbox=bbox, epsg=epsg, tmp_dir=query_dir, *args, **kwargs)
 
         return qmap, snow_data, ice_data, None, bbox
 
