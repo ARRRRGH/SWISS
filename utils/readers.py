@@ -38,6 +38,7 @@ def rasterio_to_xarray(arr, meta, tmp_dir='.', fil_name=None, chunks=None, remov
     else:
         fil_name = 'tmp__' + fil_name
     tmp_path = os.path.join(tmp_dir, '%s' % fil_name)
+
     with rio.open(tmp_path, 'w', **meta) as fil2:
         fil2.write(arr)
     out = xr.open_rasterio(tmp_path, chunks=chunks)
@@ -366,12 +367,14 @@ class _RasterReader(_Reader):
                 fil_name = os.path.basename(path)
 
                 # crop tif and save to tmp file
-                _, tmp_path = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, remove=False, fil_name=fil_name,
-                                                      *args, **kwargs)
+                _, tmp_path = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, remove=False, *args, **kwargs)
 
                 # warp image
                 out, _ = _RasterReader._warp_tif(tmp_path, bbox=bbox, epsg=epsg, chunks=chunks, fil_name=fil_name,
                                                  *args, **kwargs)
+
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
                 out.attrs['path'] = path
                 out_xarrs.append(out)
@@ -410,15 +413,8 @@ class _RasterReader(_Reader):
                              "count": fil.count,
                              "dtype": out_img.dtype})
 
-        # tmp_path = os.path.join(tmp_dir, '%s.tmp' % str(uuid.uuid4()))
-        # with rio.open(tmp_path, 'w', **out_meta) as fil:
-        #     fil.write(out_img)
-
         out, tmp_path = rasterio_to_xarray(out_img, out_meta, tmp_dir=tmp_dir,
                                            fil_name=fil_name, *args, **kwargs)
-
-        # if os.path.exists(tmp_path):
-        #     os.remove(tmp_path)
 
         return out, tmp_path
 
