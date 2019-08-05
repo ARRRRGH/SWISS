@@ -30,27 +30,31 @@ from rasterio.vrt import WarpedVRT
 from fiona.crs import from_epsg
 
 from tqdm import tqdm
+from shapely import wkt
+import pickle as pkl
 
 
-def rasterio_to_xarray(arr, meta, tmp_dir='.', fil_name=None, chunks=None, remove=True, *args, **kwargs):
+def rasterio_to_xarray(arr, meta, tmp_dir='.', fil_name=None, chunks=None, out=False, *args, **kwargs):
     if fil_name is None:
         fil_name = str(uuid.uuid4())
-    else:
-        fil_name = 'tmp__' + fil_name
     tmp_path = os.path.join(tmp_dir, '%s' % fil_name)
 
     with rio.open(tmp_path, 'w', **meta) as fil2:
         fil2.write(arr)
-    out = xr.open_rasterio(tmp_path, chunks=chunks)
+    ret = xr.open_rasterio(tmp_path, chunks=chunks)
+    ret = clean_raster_xarray(ret)
 
-    out = out.squeeze('band', drop=True)
-    # out = out.where(out != out.attrs['nodatavals'][0])
-    # out.attrs['nodatavals'] = np.nan
-
-    if chunks is None and remove:
+    if chunks is None and not out:
         os.remove(tmp_path)
 
-    return out, tmp_path
+    return ret, tmp_path
+
+
+def clean_raster_xarray(ret):
+    ret = ret.squeeze('band', drop=True)
+    ret = ret.where(ret != ret.attrs['nodatavals'][0])
+    ret.attrs['nodatavals'] = np.nan
+    return ret
 
 
 class _Reader(object):
@@ -66,7 +70,7 @@ class _Reader(object):
 
     def _which_time(self, time):
         if time is None:
-            bbox = self.time
+            time = self.time
         return time
 
     def query(self, time=None, bbox=None, n_jobs=2, epsg=None, *args, **kwargs):
@@ -96,35 +100,55 @@ class ICESATReader(_Reader):
 
     keywords = {(2, 6): atl06, (2, 8): atl08}
 
-    def __init__(self, dirpath, mission=2, prod_nr=8, bbox=None, time=None):
-        _Reader.__init__(self, path=dirpath, bbox=bbox, time=time)
+    def __init__(self, path, mission=2, prod_nr=6, bbox=None, time=None):
+        _Reader.__init__(self, path=path, bbox=bbox, time=time)
         self.mission = mission
         self.prod_nr = prod_nr
         self.dict = self.keywords[(self.mission, self.prod_nr)]
 
-    def query(self, n_jobs=2, time=None, segments=None, bbox=None, hull=False, alpha=.1, buffer=.1, *args, **kwargs):
+    def query(self, n_jobs=2, time=None, segments=None, bbox=None, hull=False, out=False, fil_name='tmp__ice.pkl',
+              alpha=.1, buffer=.1, tmp_dir='.', *args, **kwargs):
         """
         Reads the icesat data files according to the query specifications.
         """
         bbox = self._which_bbox(bbox)
         time = self._which_time(time)
 
+        tmp_path = os.path.join(tmp_dir, fil_name)
+        if os.path.exists(tmp_path):
+            if fil_name.endswith('pkl'):
+                with open(tmp_path, 'rb') as f:
+                    dframe = pkl.load(f)
+            elif fil_name.endswith('csv'):
+                dframe = pd.read_csv(tmp_path)
+                dframe['geometry'] = dframe['geometry'].apply(wkt.loads)
+            return dframe, bbox
+
+        # get files which lie in time
         fnames = glob.glob(os.path.join(self.path, '*.h5'))
-        fnames = np.array_split(self.select_files(fnames, time=time, segments=segments), n_jobs)
+        fnames = self.select_files(fnames, time=time, segments=segments)
+
+        # start reading jobs
+        fnames = np.array_split(fnames, n_jobs)
         dfs, bboxs = zip(*Parallel(n_jobs=n_jobs,
-                                   verbose=5)(delayed(self._read)(f, bbox=bbox, *args, **kwargs) for f in tqdm(fnames)))
+                                   verbose=5)(delayed(self.read)(f, bbox=bbox, *args, **kwargs) for f in tqdm(fnames)))
 
         dframe, bbox = pd.concat(dfs).reset_index(drop=True), bboxs[0]
 
+        if out:
+            dframe.to_pickle(tmp_path)
+
+        # if required, construct hull around points
         if hull:
             convex_hull, edge_points = hp.concave_hull(dframe.geometry, alpha=alpha)
-            epsg = hp.get_epsg_from_string(dframe)
+            epsg = hp.get_epsg_from_string(dframe.crs['init'])
             return dframe, bs.BBox(bbox=convex_hull.buffer(buffer), epsg=epsg, res=bbox.get_resolution(epsg))
 
         return dframe, bbox
 
-    def _read(self, fnames, bbox=None, quality=0, out=False, values=[], epsg=None, *args, **kwargs):
-        """ Params
+    def read(self, fnames, bbox=None, quality=0, out=False, values=None, epsg=None, rgts=None, *args, **kwargs):
+        """
+        Params
         ------
             fnames (iter) : iterable of paths
             crs (str) : Coordinate Reference System (as defined by GeoPandas)
@@ -132,7 +156,7 @@ class ICESATReader(_Reader):
             version (int) : which ATL
             quality (int) : use data points with quality flag < quality
             out (bool) : if True, writes data to h5 files, one for every of the six tracks
-            values (iter) : path in h5 file under ground track name (e.g. '/land_ice_segments/latitude')
+            values (iter) : path in h5 file under ground track name (e.ground_track_id. '/land_ice_segments/latitude')
 
         Returns
         -------
@@ -141,9 +165,12 @@ class ICESATReader(_Reader):
         tracks = ['gt1l', 'gt1r', 'gt2l', 'gt2r', 'gt3l', 'gt3r']
         df = pd.DataFrame()
 
+        if values is None:
+            values = []
+
         # Loop trough files
         for fname in fnames:
-            for k, g in enumerate(tracks):
+            for k, ground_track_id in enumerate(tracks):
 
                 # -----------------------------------#
                 # 1) Read in data for a single beam #
@@ -152,24 +179,36 @@ class ICESATReader(_Reader):
                 # Load variables into memory (more can be added!)
                 custom_vars = {}
                 with h5py.File(fname, 'r') as fi:
-                    lat = fi[g + self.dict['lat']][:]
-                    lon = fi[g + self.dict['lon']][:]
-                    h = fi[g + self.dict['h']][:]
-                    s_li = fi[g + self.dict['h_sigma']][:]
-                    t_dt = fi[g + self.dict['delta_time']][:]
-                    q_flag = fi[g + self.dict['q_flag']][:]
+                    lat = fi[ground_track_id + self.dict['lat']][:]
+                    lon = fi[ground_track_id + self.dict['lon']][:]
+                    h = fi[ground_track_id + self.dict['h']][:]
+                    s_li = fi[ground_track_id + self.dict['h_sigma']][:]
+                    t_dt = fi[ground_track_id + self.dict['delta_time']][:]
+                    q_flag = fi[ground_track_id + self.dict['q_flag']][:]
                     t_ref = fi[self.dict['t_ref']][:]
                     rgt = fi[self.dict['rgt']][:]
 
                     for v in values:
                         try:
-                            custom_vars[v] = fi[g + self.dict[v]][:]
+                            custom_vars[v] = fi[ground_track_id + self.dict[v]][:]
                         except:
                             print('Could not include ' + v)
                             pass
                 # ---------------------------------------------#
                 # 2) Filter data according region and quality #
                 # ---------------------------------------------#
+
+                # if rgt is supplied check whether this is in selected rgts
+                # if rgts are selected take only those
+                cont = True
+                if rgts is not None:
+                    cont = False
+                    if not hasattr(rgts, '__len__'):
+                        rgts = [rgts]
+                    cont = cont or rgt[0] in rgts
+
+                if not cont:
+                    continue
 
                 # Select a region of interest
                 if bbox is not None:
@@ -179,7 +218,7 @@ class ICESATReader(_Reader):
                 else:
                     bbox_mask = np.ones_like(lat, dtype=bool)  # get all
 
-                # Only keep good data, and data inside bbox
+                # Only keep good data, and data inside bbox and data on rgt
                 mask = (q_flag <= quality) & (np.abs(h) < 10e3) & (bbox_mask == 1)
 
                 # Update variables
@@ -205,7 +244,7 @@ class ICESATReader(_Reader):
                 t_year = self.gps2dyr(t_gps)
                 time = np.vectorize(self._decimal_to_datetime)(decimal=t_year)
 
-                t_iso = np.vectorize(lambda d: dt.datetime.strftime(d, format='%Y-%m-%d'))(time)
+                # t_iso = np.vectorize(lambda d: dt.datetime.strftime(d, format='%Y-%m-%d'))(time)
 
                 # Determine orbit type
                 i_asc, i_des = self.track_type(t_year, lat)
@@ -219,17 +258,17 @@ class ICESATReader(_Reader):
                 custom_vars['y'] = lat
                 custom_vars['height'] = h
                 custom_vars['time'] = time
-                custom_vars['t_sec'] = t_gps
-                custom_vars['time'] = t_iso
+                # custom_vars['t_sec'] = t_gps
+                # custom_vars['time'] = t_iso
                 custom_vars['s_elv'] = s_li
                 custom_vars['q_flg'] = q_flag
                 custom_vars['ascending'] = i_asc
-                custom_vars['ground_track_id'] = [g] * len(lon)
+                custom_vars['ground_track_id'] = [ground_track_id] * len(lon)
                 custom_vars['rgt'] = rgt * np.ones(len(lat))
 
                 if out:
                     # Define output file name
-                    ofile = fname.replace('.h5', '_' + g + '.h5')
+                    ofile = fname.replace('.h5', '_' + ground_track_id + '.h5')
                     fil = h5py.File(ofile, 'w')
                     for v in custom_vars.keys():
                         fil[v] = custom_vars[v]
@@ -341,7 +380,8 @@ class _RasterReader(_Reader):
     def __init__(self, path, bbox=None, time=None, *args, **kwargs):
         _Reader.__init__(self, path, bbox=bbox, time=time)
 
-    def read(self, paths=None, bbox=None, align=True, epsg=4326, chunks=None, *args, **kwargs):
+    def read(self, paths=None, bbox=None, align=True, epsg=4326, chunks=None, fil_names=None,
+             out=False, *args, **kwargs):
         """
         :param paths:
         :param bbox:
@@ -363,38 +403,48 @@ class _RasterReader(_Reader):
         if align:
             if bbox is None:
                 bbox = bs.BBox.from_tif(paths[0])
-            for path in tqdm(paths):
-                fil_name = os.path.basename(path)
+            for i, path in tqdm(enumerate(paths)):
+                if fil_names is None:
+                    fil_name = os.path.basename(path)
+                else:
+                    fil_name = fil_names[i]
 
                 # crop tif and save to tmp file
-                _, tmp_path = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, remove=False, *args, **kwargs)
+                _, tmp_path = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, out=True, *args, **kwargs)
 
                 # warp image
-                out, _ = _RasterReader._warp_tif(tmp_path, bbox=bbox, epsg=epsg, chunks=chunks, fil_name=fil_name,
-                                                 *args, **kwargs)
+                ret, tmp_path2 = _RasterReader._warp_tif(tmp_path, bbox=bbox, epsg=epsg, chunks=chunks,
+                                                         fil_name=fil_name,
+                                                         out=out, *args, **kwargs)
 
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
 
-                out.attrs['path'] = path
-                out_xarrs.append(out)
+                ret.attrs['crs'] = dict(rio.crs.CRS.from_string(ret.crs))
+                ret.attrs['path'] = tmp_path2
+
+                out_xarrs.append(ret)
                 out_bboxs.append(bbox)
 
         else:
             for path in tqdm(paths):
-                fil_name = os.path.basename(path)
-                if bbox is not None:
-                    out, _ = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, fil_name=fil_name,
-                                                     *args, **kwargs)
-                else:
-                    with rio.open(path, 'r') as fil:
-                        out = xr.open_rasterio(fil, chunks=chunks)
+                # fil_name = os.path.basename(path)
+                # if bbox is not None:
+                #     ret, path = _RasterReader._crop_tif(path, bbox=bbox, chunks=chunks, fil_name=fil_name,
+                #                                      out=out, *args, **kwargs)
+                #     out_bbox = bbox
+                # else:
+                with rio.open(path, 'r') as fil:
+                    ret = xr.open_rasterio(fil, chunks=chunks)
+                    ret = clean_raster_xarray(ret)
 
                 # make bbox that is returned
                 out_bbox = bs.BBox.from_tif(path)
 
-                out.attrs['path'] = path
-                out_xarrs.append(out)
+                ret.attrs['crs'] = dict(rio.crs.CRS.from_string(ret.crs))
+                ret.attrs['path'] = path
+
+                out_xarrs.append(ret)
                 out_bboxs.append(out_bbox)
 
         return out_xarrs, out_bboxs
@@ -419,7 +469,7 @@ class _RasterReader(_Reader):
         return out, tmp_path
 
     @staticmethod
-    def _warp_tif(path, bbox, epsg, tmp_dir='.', fil_name=None, *args, **kwargs):
+    def _warp_tif(path, bbox, epsg, tmp_dir='.', fil_name=None, resampling_method='cubic', *args, **kwargs):
         left, bottom, right, top = bbox.get_bounds(epsg=epsg)
         res = bbox.get_resolution(epsg)
 
@@ -428,7 +478,7 @@ class _RasterReader(_Reader):
         dst_transform = rio.transform.from_origin(west=left, north=top, xsize=res[0], ysize=res[1])
 
         vrt_options = {
-            'resampling': Resampling.cubic,
+            'resampling': Resampling[resampling_method],
             'crs': CRS.from_epsg(epsg),
             'transform': dst_transform,
             'height': height,
@@ -437,7 +487,6 @@ class _RasterReader(_Reader):
 
         with rio.open(path) as src:
             with WarpedVRT(src, **vrt_options) as vrt:
-
                 # At this point 'vrt' is a full dataset with dimensions,
                 # CRS, and spatial extent matching 'vrt_options'.
                 dta = vrt.read()
@@ -461,8 +510,8 @@ class _RasterReader(_Reader):
 
         # if epsg is set, change coordinates
         # fixme: incorrect transformation ?
-        if epsg is not None and not align:
-            ret = [hp.xarray_to_epsg(r, epsg) for r in ret]
+        # if epsg is not None and not align:
+        #     ret = [hp.xarray_to_epsg(r, epsg) for r in ret]
 
         return ret, bbox
 
@@ -488,10 +537,13 @@ class _TimeRasterReader(_RasterReader):
         ret.coords['time'] = ('time', np.array(times))
         ret = ret.sortby('time')
 
+        str_times = np.array(times, dtype=np.datetime64).astype(str).astype('<U13')
+        ret.attrs['path'] = dict([(t, a.attrs['path']) for t, a in zip(str_times, arrs)])
+
         # if epsg is set, change coordinates
         # fixme: incorrect transformation ?
-        if epsg is not None and not align:
-            ret = hp.xarray_to_epsg(ret, epsg)
+        # if epsg is not None and not align:
+        #     ret = hp.xarray_to_epsg(ret, epsg)
 
         return ret, bboxs
 
@@ -545,6 +597,11 @@ class SLFReader(_Reader):
         self._cached_slf_data, self.slf_stations = self.load_slf_data()
 
     def load_slf_data(self):
+        tmp_slf_path = os.path.join(self.path, 'tmp__slf_data.pkl')
+        if os.path.exists(tmp_slf_path):
+            with open(tmp_slf_path, 'rb') as f:
+                return pkl.load(f)
+
         # read station data
         slfstats_file = 'SLF_utm32_cood.csv'
         slfstats = pd.read_csv(os.path.join(self.path, slfstats_file))
@@ -553,10 +610,11 @@ class SLFReader(_Reader):
         slfstats['slf station code'] = slfstats['slf station code'].map(str) + slfstats['slf_locati,N,10,0'].map(str)
         slfstats.drop(columns=['slf_locati,N,10,0'])
 
-        slf_codes = dict((row['slf station code'],
-                          {'geometry':Point(row['X_utm,C,254'],
-                                            row['Y_utm,C,254']),
-                           'height': row['altitude_a,N,10,0']}) for idx, row in slfstats.iterrows())
+        slf_codes = np.array([[row['slf station code'], Point(row['coord__eas,N,10,0'], row['coord__nor,N,10,0']),
+                              row['altitude_a,N,10,0']] for idx, row in slfstats.iterrows()], dtype=object)
+
+        slf_codes = pd.DataFrame(data=slf_codes, columns=['code', 'geometry', 'height']).set_index('code')
+        slf_codes = gpd.GeoDataFrame(slf_codes, crs=from_epsg(2056))
 
         # read time series data
         glob_re = lambda pattern, strings: filter(re.compile(pattern).match, strings)
@@ -575,14 +633,28 @@ class SLFReader(_Reader):
         slf['time'] = pd.to_datetime(slf['time'])
 
         # convert time series data to gpd.GeoDataFrame by adding location info
-        slf['height'] = [slf_codes[code]['height'] if code in slf_codes else np.nan for code in slf['stat_abk']]
-        geometry = [slf_codes[code]['geometry'] if code in slf_codes else GeometryCollection() for code in slf['stat_abk']]
+        slf['height'] = [slf_codes.loc[code, 'height'] if code in slf_codes.index
+                         else np.nan for code in slf['stat_abk']]
+        geometry = [slf_codes.loc[code, 'geometry'] if code in slf_codes.index
+                    else GeometryCollection() for code in slf['stat_abk']]
 
-        return gpd.GeoDataFrame(slf, crs=from_epsg(2056), geometry=geometry), slf_codes
+        slf = gpd.GeoDataFrame(slf, crs=from_epsg(2056), geometry=geometry)
+        slf_codes.slf_stations.reset_index(inplace=True)
 
-    def query(self, time=None, bbox=None, epsg=None, *args, **kwargs):
+        with open(tmp_slf_path, 'wb') as f:
+            pkl.dump((slf, slf_codes), f)
+
+        return slf, slf_codes
+
+    def query(self, time=None, bbox=None, epsg=None, tmp_dir='.', fil_name='tmp__slf.pkl', out=False, *args, **kwargs):
         time = self._which_time(time)
         bbox = self._which_bbox(bbox)
+
+        tmp_path = os.path.join(tmp_dir, fil_name)
+        if os.path.exists(tmp_path):
+            with open(tmp_path, 'rb') as f:
+                slf = pkl.load(f)
+            return slf, bbox
 
         # take out measurements that are not time frame
         slf = self._filter_time(self._cached_slf_data, time)
@@ -623,5 +695,5 @@ if __name__ == '__main__':
     clsf_path = os.path.join(data, 'land_cover/corine/CLC_2012_utm32_DeFROST.tif')
     slf_path = os.path.join(data, 'SLF/one_year_imis_2019.csv')
 
-    ice = ICESATReader(dirpath=icesat_path, mission=2, prod_nr=8)
+    ice = ICESATReader(path=icesat_path, mission=2, prod_nr=8)
     gdf = ice.read()

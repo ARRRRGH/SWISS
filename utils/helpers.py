@@ -2,14 +2,15 @@ from shapely.ops import cascaded_union, polygonize
 import shapely.geometry as geometry
 from scipy.spatial import Delaunay
 import numpy as np
-import pyresample as pyr
 import pandas as pd
 import geopandas as gpd
 import re
 from shapely.geometry import Point
-from fiona.crs import from_epsg
-import dask.array as da
 
+import rasterstats as rstats
+from fiona.crs import from_epsg
+
+from joblib import Parallel, delayed
 
 def get_epsg_from_string(string):
     pattern = r'[-+]?\d+'
@@ -22,7 +23,7 @@ def geopandas_to_numpy(geometries):
 
 
 def xarray_to_epsg(xset, epsg):
-    this_epsg = get_epsg_from_string(xset.attrs['crs'])
+    this_epsg = get_epsg_from_string(xset.attrs['crs']['init'])
 
     if epsg is None or epsg == this_epsg:
         return xset
@@ -39,7 +40,8 @@ def xarray_to_epsg(xset, epsg):
     xset.coords['x'] = list(x)
     xset.coords['y'] = list(y)
 
-    xset.attrs['crs']='+init=epsg:' + str(epsg)
+    xset.attrs['crs'] = dict(from_epsg(epsg))
+
     return xset
 
 
@@ -60,142 +62,97 @@ def binarize_dataframe(dframe, var, vals, pad_lo=None, pad_hi=None):
     return _binned_dframes
 
 
-def raster_to_point(dframe, xset, method='nearest', radius_of_influence=1000, inplace=True, *args, **kwargs):
-    resample_funcs = {'nearest': pyr.kd_tree.resample_nearest}
-    resample_func = resample_funcs[method]
+def raster_to_point(dframe, xset, inplace=True, n_jobs=1, interpolate='nearest',*args, **kwargs):
 
-    grid = None
-
-    # for non time dependent vars
-    swath = None
-
-    # for time_mode
-    _time_binned_swaths = {}
-    _time_binned_dframes = {}
+    time_indeps, time_deps, time_binned_dframes = _prep_raster_to_point(dframe, xset)
 
     if not inplace:
         dframe = dframe.copy()
 
-    # make sure we are in lat / lon coordinates which is what pyresample assumes
-    assert get_epsg_from_string(dframe.crs['init']) == 4326
+    def point_query(df, path, crs, *args, **kwargs):
+        if not df.crs == crs:
+            df = df.to_crs(crs)
+        return rstats.point_query(df.geometry, path, interpolate=interpolate, *args, **kwargs)
 
-    # make sure we are in lat / lon coordinates which is what pyresample assumes
-    # since all vars in xset are aligned, check only first one
-    # fixme: is this correct?
-    first = list(xset.items())[0][1]
-    xset_epsg = get_epsg_from_string(first.attrs['crs'])
-    if not xset_epsg == 4326:
-        xset = xarray_to_epsg(xset, 4326)
+    if time_deps != {}:
+        # @fixme: might be useful to pass dfi= time_binned_dframes[time_idx].copy() as subsequent jobs are likely
+        # to use the same dfi
+        delay = (delayed(point_query)(time_binned_dframes[time_idx], path, crs, *args, **kwargs)
+                 for time_idx in time_deps for var, path, crs in time_deps[time_idx])
+        point_data_per_time_var = np.array(Parallel(n_jobs=n_jobs, verbose=5)(delay))
+
+        # (time indices * variables, nr of points) -> (time indices, variables, nr of points)
+        # print(time_deps)
+        # shape = len(time_deps), len(list(time_deps.values())[0]), point_data_per_time_var.shape[1]
+        #
+        # point_data_per_time_var = np.reshape(point_data_per_time_var, shape)
+        
+        # iterate over point_data_per_time_var as in Parallel execution above
+        running_idx = 0
+        for i, time_idx in enumerate(time_deps):
+            dfi = time_binned_dframes[time_idx]
+
+            # assign time dependent vars to dframe
+            for j, var_at_time in enumerate(time_deps[time_idx]):
+                var, path, crs = var_at_time
+                if var not in dframe:
+                    dframe[var + '_time_delta'] = np.nan
+                    dframe[var + '_time_ind'] = np.nan
+                    dframe[var] = np.nan
+                # print(len(dfi), len(point_data_per_time_var[running_idx + j]), running_idx + j)
+                # print(time_deps)
+                dframe.loc[dfi.index, var] = point_data_per_time_var[running_idx + j]
+
+                xset_time = xset.coords['time'][time_idx].data
+                time_delta = dfi.time.astype(np.datetime64).subtract(xset_time)
+
+                dframe.loc[dfi.index, var + '_time_delta'] = time_delta
+                dframe.loc[dfi.index, var + '_time_ind'] = np.int(time_idx)
+
+            running_idx += len(time_deps[time_idx])
+
+    if time_indeps:
+        delay = (delayed(point_query)(dframe.copy(), path, crs, *args, **kwargs)
+                 for var, path, crs in time_indeps)
+        point_data_per_var = Parallel(n_jobs=n_jobs, verbose=5)(delay)
+
+        # write data to data frame
+        for j in range(len(point_data_per_var)):
+            var, path, crs = time_indeps[j]
+            dframe.loc[:, var] = point_data_per_var[j]
+
+    return dframe
+
+
+def _prep_raster_to_point(dframe, xset):
+    # for time_mode
+    time_binned_dframes = {}
 
     time_deps = {}
     time_indeps = []
     for var in xset.data_vars:
-        dframe[var] = np.nan
-
-        # all vars in xset are aligned
-        if grid is None:
-            lats = xset[var]['y']
-            lons = xset[var]['x']
-            lons, lats = np.meshgrid(lons, lats)
-            grid = pyr.geometry.GridDefinition(lats=lats, lons=lons)
-
         if 'time' in xset[var].coords:
             # all vars in xset have same time resolution, so create index and swaths only once
-            if _time_binned_swaths == {}:
-                _time_binned_dframes = binarize_dataframe(dframe, 'time', xset[var].coords['time'].data,
-                                                          pad_lo=np.datetime64('1970-01-01'),
-                                                          pad_hi=np.datetime64('now'))
+            if time_binned_dframes == {}:
+                time_binned_dframes = binarize_dataframe(dframe, 'time', xset[var].coords['time'].data,
+                                                         pad_lo=np.datetime64('1970-01-01'),
+                                                         pad_hi=np.datetime64('now'))
 
-                _time_binned_swaths = {i: pyr.geometry.SwathDefinition(lats=dfi.y, lons=dfi.x)
-                                       for i, dfi in _time_binned_dframes.items()}
+            for time_idx in time_binned_dframes.keys():
+                time = xset[var].coords['time'][time_idx].data.astype(str)[:13]
+                path = xset[var].attrs['path'][time]
+                crs = xset[var].attrs['crs']
 
-            # prepare column for time_delta
-            dframe[var + '_time_delta'] = np.nan
-            dframe[var + '_time_ind'] = np.nan
-
-            for i in _time_binned_dframes.keys():
-                if i in time_deps:
-                    time_deps[i][var] = xset[var].isel(time=i).data
+                if time_idx in time_deps:
+                    time_deps[time_idx].append((var, path, crs))
                 else:
-                    time_deps[i] = {var: xset[var].isel(time=i).data}
+                    time_deps[time_idx] = [(var, path, crs)]
 
-        # if variable is not time dependent, create one entry with all data points
+        # if variable is not time dependent
         else:
-            # same data points for all vars
-            if swath is None:
-                swath = pyr.geometry.SwathDefinition(lats=dframe.y, lons=dframe.x)
+            time_indeps.append((var, xset[var].attrs['path'], xset[var].attrs['crs']))
 
-            time_indeps.append((var, xset[var].data))
-
-    # If there are time dependent vars, run kdtree queries including time independent vars
-    if time_deps != {}:
-        for i in time_deps:
-            # stack arrays
-            time_dep_vars, time_dep_arrs = zip(*time_deps[i].items())
-
-            if time_indeps:
-                time_indep_vars, time_indep_arrs = zip(*time_indeps)
-            else:
-                time_indep_vars, time_indep_arrs = [], []
-
-            arrs = list(time_dep_arrs) + list(time_indep_arrs)
-            if len(arrs) > 1:
-                data_at_t = da.stack([a for a in arrs], axis=2)
-                data_at_t = np.array(data_at_t)
-            else:
-                data_at_t = np.array(arrs[0])
-
-            data = resample_func(source_geo_def=grid,
-                                 target_geo_def=_time_binned_swaths[i],
-                                 data=data_at_t,
-                                 radius_of_influence=radius_of_influence,
-                                 fill_value = np.nan,
-                                 *args, **kwargs)
-
-            if len(data_at_t.shape) == 2:
-                data = np.atleast_2d(data).transpose()
-
-            dfi = _time_binned_dframes[i]
-
-            # assign time dependent vars to dframe
-            for i, var in enumerate(time_dep_vars):
-                dframe.loc[dfi.index, var] = pd.Series(data[:, i])
-
-                xset_time = xset.coords['time'][i].data
-                time_delta = dfi.time.astype(np.datetime64).subtract(xset_time)
-
-                dframe.loc[dfi.index, var + '_time_delta'] = time_delta
-                dframe.loc[dfi.index, var + '_time_ind'] = np.int(i)
-
-            # assign time independent vars to dframe
-            for i, var in enumerate(time_indep_vars):
-                dframe.loc[dfi.index, var] = pd.Series(data[:, i+len(time_dep_vars)])
-        return dframe
-
-    # if there are no time independent vars, run kdtree query for all points at once
-    if time_indeps:
-        time_indep_vars, time_indep_arrs = zip(*time_indeps)
-        arrs = list(time_indep_arrs)
-
-        if len(arrs) > 1:
-            vars = da.stack([a for a in arrs], axis=2)
-            vars = np.array(vars)
-        else:
-            vars = np.array(arrs[0])
-
-        data = resample_func(source_geo_def=grid,
-                             target_geo_def=swath,
-                             data=vars,
-                             radius_of_influence=radius_of_influence,
-                             *args, **kwargs)
-
-        if len(vars.shape) == 2:
-            data = np.atleast_2d(data).transpose()
-
-        for i, var in enumerate(time_indep_vars):
-            dframe.loc[:, var] = pd.Series(data[:, i])
-
-    return dframe
+    return time_indeps, time_deps, time_binned_dframes
 
 
 def concave_hull(points, alpha):
