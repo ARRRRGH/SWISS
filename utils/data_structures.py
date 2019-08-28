@@ -11,12 +11,22 @@ class SWISSMap(object):
     def __init__(self, slf_path=None, ice_path=None, dem_path=None, slope_path=None, sc_path=None, lc_path=None,
                  bbox=None, time=None, calc_dir='.', load_dir=None, *args, **kwargs):
         """
+          A SWISSMap object bundles and organizes queries to the readers for the different data sets
+          (SLF, ICE, DEM, slope and land cover). Queries create directories with meta data and possibly
+          data to easily and efficiently reload the query results.
 
-        :param paths: paths in the following order (sc_path, ice_path, dem_path, slope_path, slf_path, lc_path)
-        :param bbox: (bs.BBox)
-        :param res: resolution in epsg units
-        :param epsg: resolution coordinate unit
-        :param time: time period given in isoformat strings (start YYYY-MM-DD, end YYYY-MM-DD)
+          :param slf_path:
+          :param ice_path:
+          :param dem_path:
+          :param slope_path:
+          :param sc_path:
+          :param lc_path:
+          :param bbox:
+          :param time:
+          :param calc_dir: directory where query directories are created
+          :param load_dir: load the data set paths from previous query by providing its query_dir
+          :param args:
+          :param kwargs:
         """
         self.FIL_NAME_ICE = 'tmp__ice.pkl'
         self.FIL_NAME_SLF = 'tmp__slf.pkl'
@@ -24,7 +34,7 @@ class SWISSMap(object):
         self.DIR_NAME_SNOW_COVER = 'snow_data'
         self.DIR_NAME_BG_RASTERS = 'bg_rasters_data'
         self.DIR_NAME_TABULAR = 'tabular_data'
-        self.FIL_NAMES_TIME_INV_VARS = {'dem': 'tmp__dem.tif', 'land_cover': 'tmp__land_cover.tif',
+        self.FIL_NAMES_BG_RASTERS = {'dem': 'tmp__dem.tif', 'land_cover': 'tmp__land_cover.tif',
                                         'slope': 'tmp__slope.tif'}
 
         self.calc_dir = calc_dir
@@ -64,19 +74,42 @@ class SWISSMap(object):
 
     def query(self, time=None, bbox=None, segments=None, epsg=None, out=False, query_dir_name=None, chunks='auto',
               align=False, *args, **kwargs):
+        """
+        Query the data sets.
+
+        :param time: time frame as tuple with start end given each as None or str in iso format or datetime
+        :param bbox: bounding box, must be bs.BBox, is ignored if align is not True
+        :param segments:
+        :param epsg: return output in this transformation, is ignored if align is not True
+        :param out: if True, force query output to be saved to query_dir. For large data sets
+                    this can be very time consuming!
+        :param query_dir_name: name for the query_dir to be created
+        :param chunks: one of ('auto', None, map as for dask arrays e.g. {'x': 1000, 'y':1000}). If None, the query
+                       output is stored in the query_dir
+        :param align: whether to align the data sets, i.e. to crop and warp them. If True, the query output is stored
+                      in the query_dir.
+        :param args:
+        :param kwargs:
+
+        :return:
+            background_rasters : xarray.Dataset, if chunks not None is based on dask arrays
+            snow_rasters,
+            slf_data,
+            bbox
+        """
         time = self._convert_time_to_datetime(time)
 
+        # there is data output to the query_dir
         is_query_saved = chunks is None or out or align
 
         dir_names = self._prepare_query_dir(query_dir_name, is_query_saved, time=time, bbox=bbox,
                                             segments=segments, epsg=epsg, chunks=chunks, **kwargs)
         query_dir, load_dir_specs_path, bg_rasters_query_dir, query_dir, snow_query_dir, tabular_query_dir = dir_names
 
-        print('Writing output to', query_dir)
-
         if chunks == 'auto':
             chunks = {'x':'auto', 'y':'auto'}
 
+        print('Using ', query_dir, 'as query_dir...')
         return self._query(time, bbox, segments, epsg, align, chunks,
                            out, is_query_saved, bg_rasters_query_dir,
                            snow_query_dir, tabular_query_dir, *args, **kwargs)
@@ -86,18 +119,21 @@ class SWISSMap(object):
 
         # Read variables, make sure that, in case no bbox is supplied, data are aligned
         # by overriding bbox
+        print('Query ICESat data ...')
         ice_data, bbox = self.icesat_reader.query(time=time, bbox=bbox, segments=segments, out=is_query_saved,
                                                   tmp_dir=tabular_query_dir, fil_name=self.FIL_NAME_ICE,
                                                   epsg=epsg, *args, **kwargs)
-
+        print('Query snow cover data ...')
         snow_rasters, _ = self.snow_rasters_reader.query(time=time, bbox=bbox, epsg=epsg, tmp_dir=snow_query_dir,
                                                          out=out, chunks=chunks, align=align, *args, **kwargs)
 
-        fil_names = list(self.FIL_NAMES_TIME_INV_VARS.values())
+        print('Query background rasters ...')
+        fil_names = list(self.FIL_NAMES_BG_RASTERS.values())
         bg_rasters, _ = self._get_bg_rasters(bbox=bbox, epsg=epsg, tmp_dir=bg_rasters_query_dir, out=out,
                                              fil_names=fil_names, chunks=chunks, align=align, *args, **kwargs)
 
-        slf_data, _ = self.slf_reader.query(time=time, bbox=bbox, epsg=epsg, tmp_dir=tabular_query_dir, 
+        print('Query SLF data ...')
+        slf_data, _ = self.slf_reader.query(time=time, bbox=bbox, epsg=epsg, tmp_dir=tabular_query_dir,
                                             fil_name=self.FIL_NAME_SLF, out=is_query_saved, *args, **kwargs)
 
         return bg_rasters, snow_rasters, ice_data, slf_data, bbox,
@@ -121,9 +157,9 @@ class SWISSMap(object):
             os.makedirs(tabular_query_dir)
 
         if is_query_saved:
-            dem_path = os.path.join(bg_rasters_query_dir, self.FIL_NAMES_TIME_INV_VARS['dem'])
-            lc_path = os.path.join(bg_rasters_query_dir, self.FIL_NAMES_TIME_INV_VARS['land_cover'])
-            slope_path = os.path.join(bg_rasters_query_dir, self.FIL_NAMES_TIME_INV_VARS['slope'])
+            dem_path = os.path.join(bg_rasters_query_dir, self.FIL_NAMES_BG_RASTERS['dem'])
+            lc_path = os.path.join(bg_rasters_query_dir, self.FIL_NAMES_BG_RASTERS['land_cover'])
+            slope_path = os.path.join(bg_rasters_query_dir, self.FIL_NAMES_BG_RASTERS['slope'])
             ice_path = os.path.join(tabular_query_dir, self.FIL_NAME_ICE)
             slf_path = os.path.join(tabular_query_dir, self.FIL_NAME_SLF)
 

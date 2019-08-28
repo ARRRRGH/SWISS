@@ -6,16 +6,33 @@ import pandas as pd
 import geopandas as gpd
 import re
 from shapely.geometry import Point
+from sklearn.cluster import DBSCAN
 
 import rasterstats as rstats
 from fiona.crs import from_epsg
 
 from joblib import Parallel, delayed
 
+
 def get_epsg_from_string(string):
     pattern = r'[-+]?\d+'
     epsg = int(re.findall(pattern, string)[0])
     return epsg
+
+
+def to_crs(dframe, crs=None, epsg=None, inplace=False):
+    assert not (crs is None and epsg is None)
+    if epsg is not None:
+        crs = from_epsg(epsg)
+    if not inplace:
+        dframe = dframe.to_crs(crs)
+    else:
+        dframe.to_crs(crs, inplace=True)
+
+    xy = np.array([[pt.coords[0][0], pt.coords[0][1]] for pt in dframe['geometry']])
+    dframe['x'] = xy[:, 0]
+    dframe['y'] = xy[:, 1]
+    return dframe
 
 
 def geopandas_to_numpy(geometries):
@@ -62,7 +79,10 @@ def binarize_dataframe(dframe, var, vals, pad_lo=None, pad_hi=None):
     return _binned_dframes
 
 
-def raster_to_point(dframe, xset, inplace=True, n_jobs=1, interpolate='nearest',*args, **kwargs):
+def raster_to_point(dframe, xset, inplace=True, n_jobs=1, interpolate='nearest', zonal_stats=False, buffer=None,
+                    add_stats={}, col_name='', *args, **kwargs):
+
+    assert not (zonal_stats and buffer is None)
 
     time_indeps, time_deps, time_binned_dframes = _prep_raster_to_point(dframe, xset)
 
@@ -74,10 +94,23 @@ def raster_to_point(dframe, xset, inplace=True, n_jobs=1, interpolate='nearest',
             df = df.to_crs(crs)
         return rstats.point_query(df.geometry, path, interpolate=interpolate, *args, **kwargs)
 
+    def zonal_query(df, path, crs, *args, **kwargs):
+        if not df.crs == crs:
+            df = df.to_crs(crs)
+        geoms = [geom.buffer(buffer) for geom in df.geometry]
+        return rstats.zonal_stats(geoms, path, add_stats=add_stats)
+
+    if zonal_stats:
+        query_func = zonal_query
+        if col_name == '':
+            col_name = 'zonal'
+    else:
+        query_func = point_query
+
     if time_deps != {}:
         # @fixme: might be useful to pass dfi= time_binned_dframes[time_idx].copy() as subsequent jobs are likely
         # to use the same dfi
-        delay = (delayed(point_query)(time_binned_dframes[time_idx], path, crs, *args, **kwargs)
+        delay = (delayed(query_func)(time_binned_dframes[time_idx], path, crs, *args, **kwargs)
                  for time_idx in time_deps for var, path, crs in time_deps[time_idx])
         point_data_per_time_var = np.array(Parallel(n_jobs=n_jobs, verbose=5)(delay))
 
@@ -95,31 +128,42 @@ def raster_to_point(dframe, xset, inplace=True, n_jobs=1, interpolate='nearest',
             # assign time dependent vars to dframe
             for j, var_at_time in enumerate(time_deps[time_idx]):
                 var, path, crs = var_at_time
+
+                if col_name != '':
+                    var_name = var + '_' + col_name
+                else:
+                    var_name = var
+
                 if var not in dframe:
-                    dframe[var + '_time_delta'] = np.nan
-                    dframe[var + '_time_ind'] = np.nan
-                    dframe[var] = np.nan
-                # print(len(dfi), len(point_data_per_time_var[running_idx + j]), running_idx + j)
-                # print(time_deps)
-                dframe.loc[dfi.index, var] = point_data_per_time_var[running_idx + j]
+                    dframe[var_name + '_time_delta'] = np.nan
+                    dframe[var_name + '_time_ind'] = np.nan
+                    dframe[var_name] = np.nan
+
+                dframe.loc[dfi.index, var_name] = point_data_per_time_var[running_idx + j]
 
                 xset_time = xset.coords['time'][time_idx].data
                 time_delta = dfi.time.astype(np.datetime64).subtract(xset_time)
 
-                dframe.loc[dfi.index, var + '_time_delta'] = time_delta
-                dframe.loc[dfi.index, var + '_time_ind'] = np.int(time_idx)
+                dframe.loc[dfi.index, var_name + '_time_delta'] = time_delta
+                dframe.loc[dfi.index, var_name + '_time_ind'] = np.int(time_idx)
 
             running_idx += len(time_deps[time_idx])
 
     if time_indeps:
-        delay = (delayed(point_query)(dframe.copy(), path, crs, *args, **kwargs)
+        delay = (delayed(query_func)(dframe.copy(), path, crs, *args, **kwargs)
                  for var, path, crs in time_indeps)
         point_data_per_var = Parallel(n_jobs=n_jobs, verbose=5)(delay)
 
         # write data to data frame
         for j in range(len(point_data_per_var)):
             var, path, crs = time_indeps[j]
-            dframe.loc[:, var] = point_data_per_var[j]
+
+            if col_name != '':
+                var_name = var + '_' + col_name
+            else:
+                var_name = var
+
+            dframe.loc[:, var_name] = point_data_per_var[j]
 
     return dframe
 
@@ -195,3 +239,13 @@ def concave_hull(points, alpha):
     triangles = list(polygonize(m))
 
     return cascaded_union(triangles), edge_points
+
+
+def cluster_points(dframe, epsilon, min_samples, *args, **kwargs):
+    dframe = to_crs(dframe, epsg=4326)
+    coords = np.radians(dframe[['x', 'y']].values)
+    db = DBSCAN(eps=epsilon, min_samples=min_samples, *args, **kwargs)
+    clusters = db.fit_predict(coords)
+    return clusters, db.core_sample_indices_
+
+

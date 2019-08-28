@@ -86,7 +86,8 @@ class ICESATReader(_Reader):
              'q_flag': '/land_ice_segments/atl06_quality_summary',
              't_ref': '/ancillary_data/atlas_sdp_gps_epoch',
              'segment_id': '/land_ice_segments/segment_id',
-             'rgt': '/orbit_info/rgt'}
+             'rgt': '/orbit_info/rgt',
+             'cycle_number': '/orbit_info/cycle_number'}
 
     atl08 = {'lat': '/land_segments/latitude',
              'lon': '/land_segments/longitude',
@@ -109,13 +110,14 @@ class ICESATReader(_Reader):
     def query(self, n_jobs=2, time=None, segments=None, bbox=None, hull=False, out=False, fil_name='tmp__ice.pkl',
               alpha=.1, buffer=.1, tmp_dir='.', *args, **kwargs):
         """
-        Reads the icesat data files according to the query specifications.
+        Reads the ICESat data files according to the query specifications if there is no file fil_name in tmp_dir.
+        If there is a file fil_name in tmp_dir, it is assumed that the query needs just to be loaded from fil_name.
         """
         bbox = self._which_bbox(bbox)
         time = self._which_time(time)
 
         tmp_path = os.path.join(tmp_dir, fil_name)
-        if os.path.exists(tmp_path):
+        if fil_name.endswith('pkl') and os.path.exists(tmp_path):
             if fil_name.endswith('pkl'):
                 with open(tmp_path, 'rb') as f:
                     dframe = pkl.load(f)
@@ -156,7 +158,7 @@ class ICESATReader(_Reader):
             version (int) : which ATL
             quality (int) : use data points with quality flag < quality
             out (bool) : if True, writes data to h5 files, one for every of the six tracks
-            values (iter) : path in h5 file under ground track name (e.ground_track_id. '/land_ice_segments/latitude')
+            values (iter) : path in h5 file under ground track name (e.g. ground_track_id. '/land_ice_segments/latitude')
 
         Returns
         -------
@@ -187,6 +189,7 @@ class ICESATReader(_Reader):
                     q_flag = fi[ground_track_id + self.dict['q_flag']][:]
                     t_ref = fi[self.dict['t_ref']][:]
                     rgt = fi[self.dict['rgt']][:]
+                    cycle_number = fi[self.dict['cycle_number']][:]
 
                     for v in values:
                         try:
@@ -265,6 +268,7 @@ class ICESATReader(_Reader):
                 custom_vars['ascending'] = i_asc
                 custom_vars['ground_track_id'] = [ground_track_id] * len(lon)
                 custom_vars['rgt'] = rgt * np.ones(len(lat))
+                custom_vars['cycle_number'] = cycle_number * np.ones(len(lat))
 
                 if out:
                     # Define output file name
@@ -610,11 +614,11 @@ class SLFReader(_Reader):
         slfstats['slf station code'] = slfstats['slf station code'].map(str) + slfstats['slf_locati,N,10,0'].map(str)
         slfstats.drop(columns=['slf_locati,N,10,0'])
 
-        slf_codes = np.array([[row['slf station code'], Point(row['coord__eas,N,10,0'], row['coord__nor,N,10,0']),
+        slf_codes = np.array([[row['slf station code'], Point(row['X_utm,C,254'], row['Y_utm,C,254']),
                               row['altitude_a,N,10,0']] for idx, row in slfstats.iterrows()], dtype=object)
 
         slf_codes = pd.DataFrame(data=slf_codes, columns=['code', 'geometry', 'height']).set_index('code')
-        slf_codes = gpd.GeoDataFrame(slf_codes, crs=from_epsg(2056))
+        slf_codes = gpd.GeoDataFrame(slf_codes, crs=from_epsg(32632))
 
         # read time series data
         glob_re = lambda pattern, strings: filter(re.compile(pattern).match, strings)
@@ -638,8 +642,8 @@ class SLFReader(_Reader):
         geometry = [slf_codes.loc[code, 'geometry'] if code in slf_codes.index
                     else GeometryCollection() for code in slf['stat_abk']]
 
-        slf = gpd.GeoDataFrame(slf, crs=from_epsg(2056), geometry=geometry)
-        slf_codes.slf_stations.reset_index(inplace=True)
+        slf = gpd.GeoDataFrame(slf, crs=from_epsg(32632), geometry=geometry)
+        slf_codes.reset_index(inplace=True)
 
         with open(tmp_slf_path, 'wb') as f:
             pkl.dump((slf, slf_codes), f)
