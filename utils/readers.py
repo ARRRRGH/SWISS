@@ -222,7 +222,7 @@ class ICESATReader(_Reader):
                     bbox_mask = np.ones_like(lat, dtype=bool)  # get all
 
                 # Only keep good data, and data inside bbox and data on rgt
-                mask = (q_flag <= quality) & (np.abs(h) < 10e3) & (bbox_mask == 1)
+                mask = (q_flag <= quality) & (bbox_mask == 1)
 
                 # Update variables
                 lat, lon, h, s_li, t_dt, q_flag = lat[mask], lon[mask], h[mask], \

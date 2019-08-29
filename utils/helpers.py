@@ -242,8 +242,8 @@ def concave_hull(points, alpha):
 
 
 def cluster_points(dframe, epsilon, min_samples, *args, **kwargs):
-    dframe = to_crs(dframe, epsg=4326)
-    coords = np.radians(dframe[['x', 'y']].values)
+    dframe = to_crs(dframe.copy(), epsg=4326)
+    coords = np.radians(dframe[['x', 'y']].values.copy())
     db = DBSCAN(eps=epsilon, min_samples=min_samples, *args, **kwargs)
     clusters = db.fit_predict(coords)
     return clusters, db.core_sample_indices_
