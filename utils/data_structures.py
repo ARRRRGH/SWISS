@@ -78,7 +78,8 @@ class SWISSMap(object):
         Query the data sets.
 
         :param time: time frame as tuple with start end given each as None or str in iso format or datetime
-        :param bbox: bounding box, must be bs.BBox, is ignored if align is not True
+        :param bbox: bounding box, must be bs.BBox, affects only non-raster data (i.e. ICESat data) if
+                     if align is False
         :param segments:
         :param epsg: return output in this transformation, is ignored if align is not True
         :param out: if True, force query output to be saved to query_dir. For large data sets
