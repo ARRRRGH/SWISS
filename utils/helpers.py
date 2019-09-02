@@ -113,7 +113,7 @@ def raster_to_point(dframe, xset, inplace=True, n_jobs=1, interpolate='nearest',
     if time_deps != {}:
         # @fixme: might be useful to pass dfi= time_binned_dframes[time_idx].copy() as subsequent jobs are likely
         # to use the same dfi
-        delay = (delayed(query_func)(time_binned_dframes[time_idx], path, crs, *args, **kwargs)
+        delay = (delayed(query_func)(time_binned_dframes[time_idx].copy(), path, crs, *args, **kwargs)
                  for time_idx in time_deps for var, path, crs in time_deps[time_idx])
         point_data_per_time_var = np.array(Parallel(n_jobs=n_jobs, verbose=5)(delay))
 
