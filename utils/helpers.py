@@ -80,7 +80,7 @@ def binarize_dataframe(dframe, var, vals, pad_lo=None, pad_hi=None):
 
 
 def raster_to_point(dframe, xset, inplace=True, n_jobs=1, interpolate='nearest', zonal_stats=False, buffer=None,
-                    add_stats={}, col_name='', *args, **kwargs):
+                    add_stats=None, col_name='', *args, **kwargs):
 
     assert not (zonal_stats and buffer is None)
 
@@ -88,6 +88,9 @@ def raster_to_point(dframe, xset, inplace=True, n_jobs=1, interpolate='nearest',
 
     if not inplace:
         dframe = dframe.copy()
+
+    if add_stats is None:
+        add_stats = {}
 
     def point_query(df, path, crs, *args, **kwargs):
         if not df.crs == crs:
