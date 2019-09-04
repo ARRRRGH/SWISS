@@ -118,12 +118,15 @@ class ICESATReader(_Reader):
 
         tmp_path = os.path.join(tmp_dir, fil_name)
         if fil_name.endswith('pkl') and os.path.exists(tmp_path):
+
             if fil_name.endswith('pkl'):
                 with open(tmp_path, 'rb') as f:
                     dframe = pkl.load(f)
+
             elif fil_name.endswith('csv'):
                 dframe = pd.read_csv(tmp_path)
                 dframe['geometry'] = dframe['geometry'].apply(wkt.loads)
+
             return dframe, bbox
 
         # get files which lie in time
@@ -155,7 +158,7 @@ class ICESATReader(_Reader):
             fnames (iter) : iterable of paths
             crs (str) : Coordinate Reference System (as defined by GeoPandas)
             bbox (BBox) : data frame with one polygon entry
-            version (int) : which ATL
+            version (int) : which ATLAS
             quality (int) : use data points with quality flag < quality
             out (bool) : if True, writes data to h5 files, one for every of the six tracks
             values (iter) : path in h5 file under ground track name (e.g. ground_track_id. '/land_ice_segments/latitude')
@@ -222,7 +225,7 @@ class ICESATReader(_Reader):
                     bbox_mask = np.ones_like(lat, dtype=bool)  # get all
 
                 # Only keep good data, and data inside bbox and data on rgt
-                mask = (q_flag <= quality) & bbox_mask
+                mask = bbox_mask & (q_flag <= quality)
 
                 # Update variables
                 lat, lon, h, s_li, t_dt, q_flag = lat[mask], lon[mask], h[mask], \
@@ -233,8 +236,6 @@ class ICESATReader(_Reader):
 
                 # Test for no data
                 if len(h) == 0: continue
-
-                # Test if within time bounds
 
                 # -------------------------------------#
                 # 3) Convert time and separate tracks #
@@ -286,7 +287,7 @@ class ICESATReader(_Reader):
                 # create proper datetime index
                 df['time'] = pd.to_datetime(df['time'])
 
-        # create GeoPandas DataFrame for proper registering
+        # create GeoPandas DataFrame
         if not df.empty:
             points = [Point(x, y) for x, y in zip(df.x, df.y)]
             df = gpd.GeoDataFrame(df, geometry=points, crs=from_epsg(4326))
@@ -363,7 +364,8 @@ class ICESATReader(_Reader):
             lat_diff = lat[i_track][i_max] - lat[i_track][i_min]
 
             # Determine track type
-            if lat_diff > 0:  i_asc[i_track] = True
+            if lat_diff > 0:
+                i_asc[i_track] = True
 
         return i_asc, np.invert(i_asc)  # index vectors
 
@@ -614,13 +616,17 @@ class SLFReader(_Reader):
         slfstats['slf station code'] = slfstats['slf station code'].map(str) + slfstats['slf_locati,N,10,0'].map(str)
         slfstats.drop(columns=['slf_locati,N,10,0'])
 
+
+        # Create CODES ##################################
         slf_codes = np.array([[row['slf station code'], Point(row['X_utm,C,254'], row['Y_utm,C,254']),
                               row['altitude_a,N,10,0']] for idx, row in slfstats.iterrows()], dtype=object)
 
-        slf_codes = pd.DataFrame(data=slf_codes, columns=['code', 'geometry', 'height']).set_index('code')
-        slf_codes = gpd.GeoDataFrame(slf_codes, crs=from_epsg(32632))
+        slf_codes = gpd.GeoDataFrame(data=slf_codes, columns=['code', 'geometry', 'height'],
+                                     crs=from_epsg(32632)).set_index('code')
 
-        # read time series data
+        slf_codes['geometry'].iloc[np.where(slf_codes['geometry'].apply(type) != GeometryCollection)] = np.nan
+
+        # Create DATA frame #############################
         glob_re = lambda pattern, strings: filter(re.compile(pattern).match, strings)
         fnames = glob_re(r'one_year_imis_\d*\.csv', os.listdir(self.path))
 
@@ -637,13 +643,12 @@ class SLFReader(_Reader):
         slf['time'] = pd.to_datetime(slf['time'])
 
         # convert time series data to gpd.GeoDataFrame by adding location info
-        slf['height'] = [slf_codes.loc[code, 'height'] if code in slf_codes.index
-                         else np.nan for code in slf['stat_abk']]
-        geometry = [slf_codes.loc[code, 'geometry'] if code in slf_codes.index
-                    else GeometryCollection() for code in slf['stat_abk']]
+        map_height = dict(zip(slf_codes.index, slf_codes['height']))
+        slf['height'] = slf['stat_abk'].map(map_height)
 
-        slf = gpd.GeoDataFrame(slf, crs=from_epsg(32632), geometry=geometry)
-        slf_codes.reset_index(inplace=True)
+        map_geom = dict(zip(slf_codes.index, slf_codes['geometry']))
+        slf = gpd.GeoDataFrame(slf, crs=from_epsg(32632), geometry=slf['stat_abk'].map(map_geom))
+        slf = slf.reset_index(inplace=True)
 
         with open(tmp_slf_path, 'wb') as f:
             pkl.dump((slf, slf_codes), f)
@@ -662,7 +667,7 @@ class SLFReader(_Reader):
 
         # take out measurements that are not time frame
         slf = self._filter_time(self._cached_slf_data, time)
-        slf.reset_index(drop=True)
+        slf = slf.reset_index(drop=True)
 
         # take out measurements that are not in bbox
         slf = self._filter_bbox(slf, bbox)
@@ -685,8 +690,9 @@ class SLFReader(_Reader):
 
     def _filter_bbox(self, df, bbox):
         if bbox is not None:
-            print(bbox.epsg, df.geometry, bbox.df.geometry)
             df = df.to_crs(epsg=bbox.epsg)
+            df = df.drop(df.index[np.where(df['geometry'].apply(type) == GeometryCollection)])
+            df = df.reset_index(drop=True)
             df = gpd.sjoin(df, bbox.df, how='left')
         return df
 

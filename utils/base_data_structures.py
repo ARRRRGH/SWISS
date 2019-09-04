@@ -19,6 +19,7 @@ class BBox(object):
                              'or shapely.geometry.MultiplePolygon')
 
         self.df = gpd.GeoDataFrame({'geometry': shape}, crs=from_epsg(epsg))
+        self.df = self.df.reset_index(drop=True)
 
         if res is None:
             self._res = 1, 1
