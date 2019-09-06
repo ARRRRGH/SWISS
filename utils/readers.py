@@ -616,15 +616,12 @@ class SLFReader(_Reader):
         slfstats['slf station code'] = slfstats['slf station code'].map(str) + slfstats['slf_locati,N,10,0'].map(str)
         slfstats.drop(columns=['slf_locati,N,10,0'])
 
-
         # Create CODES ##################################
         slf_codes = np.array([[row['slf station code'], Point(row['X_utm,C,254'], row['Y_utm,C,254']),
                               row['altitude_a,N,10,0']] for idx, row in slfstats.iterrows()], dtype=object)
 
         slf_codes = gpd.GeoDataFrame(data=slf_codes, columns=['code', 'geometry', 'height'],
                                      crs=from_epsg(32632)).set_index('code')
-
-        slf_codes['geometry'].iloc[np.where(slf_codes['geometry'].apply(type) != GeometryCollection)] = np.nan
 
         # Create DATA frame #############################
         glob_re = lambda pattern, strings: filter(re.compile(pattern).match, strings)
@@ -665,11 +662,11 @@ class SLFReader(_Reader):
                 slf = pkl.load(f)
             return slf, bbox
 
-        # take out measurements that are not time frame
+        # drop measurements that are not time frame
         slf = self._filter_time(self._cached_slf_data, time)
         slf = slf.reset_index(drop=True)
 
-        # take out measurements that are not in bbox
+        # drop measurements that are not in bbox
         slf = self._filter_bbox(slf, bbox)
 
         if epsg is not None:
