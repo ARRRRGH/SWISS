@@ -98,9 +98,9 @@ def raster_to_point(dframe, xset, inplace=True, n_jobs=1, interpolate='nearest',
         return rstats.point_query(df.geometry, path, interpolate=interpolate, *args, **kwargs)
 
     def zonal_query(df, path, crs, *args, **kwargs):
+        geoms = gpd.GeoDataFrame(geometry=[geom.buffer(buffer) for geom in df.geometry], crs=df.crs)
         if not df.crs == crs:
-            df = df.to_crs(crs)
-        geoms = [geom.buffer(buffer) for geom in df.geometry]
+            geoms = geoms.to_crs(crs)
         return rstats.zonal_stats(geoms, path, add_stats=add_stats)
 
     if zonal_stats:
